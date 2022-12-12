@@ -21,6 +21,7 @@ impl Future for IsoTpWriteFuture {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        eprintln!("polling i guess");
         let _ = ready!(self.socket.0.poll_write_ready(cx))?;
         match self.socket.0.get_ref().0.write(&self.packet) {
             Ok(_) => Poll::Ready(Ok(())),
@@ -94,6 +95,7 @@ impl IsoTpSocket {
 
     fn try_clone(&self) -> Result<Self, io::Error> {
         let fd = self.0.get_ref().0.as_raw_fd();
+        eprintln!("whelp cloning");
         unsafe {
             // essentially we're cheating and making it cheaper/easier
             // to manage multiple references to the socket by relying
