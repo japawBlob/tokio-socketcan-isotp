@@ -1,0 +1,13 @@
+[package]
+name = "tokio-socketcan-isotp"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+socketcan-isotp = { path = "/home/japaw/Codes/rust_libs/socketcan-isotp" }
+futures = "0.3"
+mio = { version = "0.8", features = ["os-ext"] }
+libc = "0.2"
+tokio = { version = "1", features = ["net"] }
