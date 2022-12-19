@@ -14,14 +14,14 @@ use tokio::io::unix::AsyncFd;
 
 pub struct IsoTpWriteFuture {
     socket: IsoTpSocket,
-    packet: [u8; RECV_BUFFER_SIZE],
+    packet: Vec<u8>,
 }
 
 impl Future for IsoTpWriteFuture {
     type Output = io::Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        eprintln!("polling i guess");
+        // eprintln!("polling i guess");
         let _ = ready!(self.socket.0.poll_write_ready(cx))?;
         match self.socket.0.get_ref().0.write(&self.packet) {
             Ok(_) => Poll::Ready(Ok(())),
@@ -86,7 +86,7 @@ impl IsoTpSocket {
         Ok(IsoTpSocket(AsyncFd::new(EventedIsoTpSocket(sock))?))
     }
 
-    pub fn write_packet(&self, packet : [u8; RECV_BUFFER_SIZE]) -> Result<IsoTpWriteFuture, Error>{
+    pub fn write_packet(&self, packet : Vec<u8>) -> Result<IsoTpWriteFuture, Error>{
         Ok(IsoTpWriteFuture {
             socket: self.try_clone()?,
             packet,
@@ -95,7 +95,7 @@ impl IsoTpSocket {
 
     fn try_clone(&self) -> Result<Self, io::Error> {
         let fd = self.0.get_ref().0.as_raw_fd();
-        eprintln!("whelp cloning");
+        /// eprintln!("whelp cloning");
         unsafe {
             // essentially we're cheating and making it cheaper/easier
             // to manage multiple references to the socket by relying
@@ -111,7 +111,7 @@ impl IsoTpSocket {
 }
 
 impl Stream for IsoTpSocket {
-    type Item = io::Result<[u8; RECV_BUFFER_SIZE]>;
+    type Item = io::Result<Vec<u8>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         loop {
@@ -125,7 +125,7 @@ impl Stream for IsoTpSocket {
 }
 
 
-impl Sink<[u8; RECV_BUFFER_SIZE]> for IsoTpSocket {
+impl Sink<Vec<u8>> for IsoTpSocket {
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -133,7 +133,7 @@ impl Sink<[u8; RECV_BUFFER_SIZE]> for IsoTpSocket {
         Poll::Ready(Ok(()))
     }
 
-    fn start_send(self: Pin<&mut Self>, item: [u8; RECV_BUFFER_SIZE]) -> Result<(), Self::Error> {
+    fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
         self.0.get_ref().0.write(&item)?;
         Ok(())
     }
