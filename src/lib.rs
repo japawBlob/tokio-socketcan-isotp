@@ -2,12 +2,10 @@ use socketcan_isotp::{self, RECV_BUFFER_SIZE};
 pub use socketcan_isotp::{Id, StandardId, Error};
 use std::io;
 use std::os::raw::c_int;
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use futures::prelude::*;
 use futures::ready;
-use mio::{event, unix::SourceFd, Interest, Registry, Token};
 use tokio::io::unix::AsyncFd;
 
 /// Future for writing data to IsoTPSocket
@@ -47,49 +45,6 @@ impl Future for IsoTpReadFuture<'_> {
                 Err(_would_block) => continue,
             }
         }
-    }
-
-}
-
-pub struct EventedIsoTpSocket(socketcan_isotp::IsoTpSocket);
-
-impl EventedIsoTpSocket {
-    fn get_ref(&self) -> &socketcan_isotp::IsoTpSocket {
-        &self.0
-    }
-    fn get_mut(&mut self) -> &mut socketcan_isotp::IsoTpSocket {
-        &mut self.0
-    }
-}
-
-impl AsRawFd for EventedIsoTpSocket {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
-}
-
-/// trait used for regstering the EventedIsoTpSocket to mio events
-impl event::Source for EventedIsoTpSocket {
-    fn register(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.0.as_raw_fd()).register(registry, token, interests)
-    }
-
-    fn reregister(
-        &mut self,
-        registry: &Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        SourceFd(&self.0.as_raw_fd()).reregister(registry, token, interests)
-    }
-
-    fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
-        SourceFd(&self.0.as_raw_fd()).deregister(registry)
     }
 }
 
