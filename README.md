@@ -9,5 +9,22 @@ You may expirience busy waiting, when write encouters io::Error:WouldBlock.
 Here is example of basic echoing server:
 
 ```rust
+use tokio_socketcan_isotp::{IsoTpSocket, StandardId, Error};
 
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    let mut socket_rx = IsoTpSocket::open(
+        "vcan0",
+        StandardId::new(0x123).expect("Invalid src id"),
+        StandardId::new(0x321).expect("Invalid src id")
+            )?;
+    let socket_tx = IsoTpSocket::open(
+        "vcan0",
+          StandardId::new(0x234).expect("Invalid src id"),
+          StandardId::new(0x322).expect("Invalid src id")
+            )?;
+    while let Ok(packet) = socket_rx.read_packet()?.await {
+        println!("{:?}", packet);
+        let rx = socket_tx.write_packet(packet)?.await;
+    }
 ```
