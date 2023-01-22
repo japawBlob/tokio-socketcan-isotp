@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-socketcan-isotp = { path = "/home/japaw/Codes/rust_libs/socketcan-isotp" }
+socketcan-isotp = { git="https://github.com/japawBlob/socketcan-isotp" }
 futures = "0.3"
 mio = { version = "0.8", features = ["os-ext"] }
 libc = "0.2"
