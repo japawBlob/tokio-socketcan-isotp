@@ -23,4 +23,5 @@ async fn main() -> Result<(), Error> {
         println!("{:?}", packet);
         let rx = socket.write_packet(packet)?.await;
     }
+}
 ```
