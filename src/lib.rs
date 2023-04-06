@@ -1,5 +1,5 @@
-use socketcan_isotp::{self, RECV_BUFFER_SIZE};
-pub use socketcan_isotp::{Id, StandardId, Error};
+use socketcan_isotp::{self};
+pub use socketcan_isotp::{Id, StandardId, ExtendedId, Error, IsoTpOptions, IsoTpBehaviour, FlowControlOptions, LinkLayerOptions, TxFlags};
 use std::io;
 use std::os::raw::c_int;
 use std::pin::Pin;
@@ -19,12 +19,35 @@ impl Future for IsoTpWriteFuture<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
-            let _ = ready!(self.socket.0.poll_write_ready(cx))?;
+            let mut guard = ready!(self.socket.0.poll_write_ready(cx))?;
             match self.socket.0.get_ref().write_vec(&self.packet) {
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    println!("would block");
+                    guard.clear_ready();
+                    continue
+                },
                 Ok(_) => return Poll::Ready(Ok(())),
-                Err(err) => return Poll::Ready(Err(err))
+                Err(err) => {
+                    return Poll::Ready(Err(err))
+                }
             }
+            // Following commented code is, how the poll should ideally work. 
+            // However due to bug in linux it is currently not working as expected,
+            // isotp socket returns ready on write, even tho it is not.
+            // This behaviour should be resolved shortly.
+            
+            // let mut guard = ready!(self.socket.0.poll_write_ready(cx))?;
+            // match guard.try_io(|inner| inner.get_ref().write_vec(&self.packet)) {
+            //         Err(_) => {
+            //             // println!("would block");
+            //             // guard.clear_ready(); //Errcomm
+            //             continue
+            //         },
+            //         Ok(_) => {
+            //             // println!("writting done");
+            //             return Poll::Ready(Ok(()))
+            //         },
+            // }
         }
     }
 }
@@ -61,9 +84,47 @@ impl IsoTpSocket {
         Ok(IsoTpSocket(AsyncFd::new(sock)?))
     }
 
+    pub fn open_with_opts(
+        ifname: &str,
+        src: impl Into<Id>,
+        dst: impl Into<Id>,
+        isotp_options: Option<IsoTpOptions>,
+        rx_flow_control_options: Option<FlowControlOptions>,
+        link_layer_options: Option<LinkLayerOptions>
+    ) -> Result<IsoTpSocket, socketcan_isotp::Error> {
+        let sock = socketcan_isotp::IsoTpSocket::open_with_opts(
+                                                                ifname, 
+                                                                src, 
+                                                                dst, 
+                                                                isotp_options,
+                                                                rx_flow_control_options, 
+                                                                link_layer_options)?;
+        sock.set_nonblocking(true)?;
+        Ok(IsoTpSocket(AsyncFd::new(sock)?))
+    }
+
     /// Open by kernel interface number
     pub fn open_if(if_index: c_int, src: impl Into<Id>, dst: impl Into<Id>) -> Result<IsoTpSocket, socketcan_isotp::Error> {
         let sock = socketcan_isotp::IsoTpSocket::open_if(if_index, src, dst)?;
+        sock.set_nonblocking(true)?;
+        Ok(IsoTpSocket(AsyncFd::new(sock)?))
+    }
+
+    pub fn open_if_with_opts(
+        if_index: c_int,
+        src: impl Into<Id>,
+        dst: impl Into<Id>,
+        isotp_options: Option<IsoTpOptions>,
+        rx_flow_control_options: Option<FlowControlOptions>,
+        link_layer_options: Option<LinkLayerOptions>
+    ) -> Result<IsoTpSocket, socketcan_isotp::Error> {
+        let sock = socketcan_isotp::IsoTpSocket::open_if_with_opts(
+                                                                if_index, 
+                                                                src, 
+                                                                dst, 
+                                                                isotp_options,
+                                                                rx_flow_control_options, 
+                                                                link_layer_options)?;
         sock.set_nonblocking(true)?;
         Ok(IsoTpSocket(AsyncFd::new(sock)?))
     }
