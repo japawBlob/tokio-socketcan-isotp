@@ -2,12 +2,24 @@
 name = "tokio-socketcan-isotp"
 version = "0.1.0"
 edition = "2021"
+authors = ["Jakub Jíra <jakub.jira@protonmail.com>"]
+license-file = "LICENCE"
+description = "A asynchronous tokio ISO-TP library build on top of socketcan-isotp."
+homepage = "https://github.com/japawBlob/tokio-socketcan-isotp"
+repository = "https://github.com/japawBlob/tokio-socketcan-isotp"
+readme = "README.md"
+keywords = ["async","socketcan", "iso-tp", "isotp", "iso-15762-2"]
+categories = ["network-programming", "os::linux-apis", "asynchronous"]
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[badges]
+maintenance = { status = "actively-developed"}
 
 [dependencies]
-socketcan-isotp = { git="https://github.com/japawBlob/socketcan-isotp" }
 futures = "0.3"
 mio = { version = "0.8", features = ["os-ext"] }
 libc = "0.2"
 tokio = { version = "1", features = ["net"] }
+bitflags = "2.4.1"
+embedded-can = "0.4"
+nix = "0.26"
+thiserror = "1.0"
