@@ -42,7 +42,10 @@ mod socketcan_isotp;
 
 pub use crate::socketcan_isotp::{
     Error, ExtendedId, FlowControlOptions, Id, IsoTpBehaviour, IsoTpOptions, LinkLayerOptions,
-    StandardId, TxFlags,
+    StandardId, TxFlags, AF_CAN, CAN_ISOTP, CAN_ISOTP_LL_OPTS, CAN_ISOTP_OPTS, CAN_ISOTP_RECV_FC,
+    CAN_ISOTP_RX_STMIN, CAN_ISOTP_TX_STMIN, CAN_MAX_DLEN, EFF_FLAG, EFF_MASK, ERR_FLAG, ERR_MASK,
+    ERR_MASK_ALL, ERR_MASK_NONE, PF_CAN, RECV_BUFFER_SIZE, RTR_FLAG, SFF_MASK, SOL_CAN_BASE,
+    SOL_CAN_ISOTP,
 };
 use futures::prelude::*;
 use futures::ready;
