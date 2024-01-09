@@ -1,12 +1,12 @@
 # tokio-socketcan-isotp
 
-This library sets up to create asynchronous wrapper around [socketcan-isotp](https://github.com/marcelbuesing/socketcan-isotp)
+This library creates asynchronous wrapper around [socketcan-isotp](https://github.com/marcelbuesing/socketcan-isotp)
 
-This library is currently work in progres. Basic API is working, but your knowledne may vary. Currently not dependent on the original, but rhather on the fork of the socketcan-isotp libary. This should be resolved in the final version.
+Currently not dependent on the original, but rather on the modified of the socketcan-isotp library, which adds read_to_vec method, in order to prevent mutable borrowing of the socket, when reading. 
 
-You may expirience busy waiting, when write encouters io::Error:WouldBlock.
+You may experience busy waiting, or soft locks when write encounters io::Error:WouldBlock. This is due to the error in Linux Kernel, which is now [solved](https://lore.kernel.org/linux-can/20230818114345.142983-1-lukas.magel@posteo.net/), but the maintainer of your Linux kernel might not have shipped it yet. I tested it on the mainline Kernel 6.6.5 and everything worked correctly. If you experience mentioned errors and cannot upgrade to newer kernel, refer to the src/lib.rs file to the poll method of the IsoTpWriteFuture, where a edit is suggested that might help with your situation.
 
-Here is example of basic echoing server:
+Example of basic echoing server on vcan0:
 
 ```rust
 use tokio_socketcan_isotp::{IsoTpSocket, StandardId, Error};
@@ -24,4 +24,12 @@ async fn main() -> Result<(), Error> {
         let rx = socket.write_packet(packet)?.await;
     }
 }
+```
+
+To setup vcan0 run following commands:
+
+```bash
+sudo modprobe can
+sudo ip link add dev vcan0 type vcan
+sudo ip link set up vcan0
 ```
