@@ -165,14 +165,14 @@ impl IsoTpSocket {
         Ok(IsoTpSocket(AsyncFd::new(sock)?))
     }
 
-    pub fn write_packet<'a>(&'a self, packet: &'a [u8]) -> Result<IsoTpWriteFuture, Error> {
-        Ok(IsoTpWriteFuture {
+    pub fn write_packet<'a>(&'a self, packet: &'a [u8]) -> IsoTpWriteFuture {
+        IsoTpWriteFuture {
             socket: self,
             packet,
-        })
+        }
     }
 
-    pub fn read_packet(&self) -> Result<IsoTpReadFuture, Error> {
-        Ok(IsoTpReadFuture { socket: self })
+    pub fn read_packet(&self) -> IsoTpReadFuture {
+        IsoTpReadFuture { socket: self }
     }
 }

@@ -19,9 +19,9 @@ async fn main() -> Result<(), Error> {
         StandardId::new(0x321).expect("Invalid src id")
             )?;
             
-    while let Ok(packet) = socket.read_packet()?.await {
+    while let Ok(packet) = socket.read_packet().await {
         println!("{:?}", packet);
-        let rx = socket.write_packet(packet)?.await;
+        let rx = socket.write_packet(packet).await;
     }
 }
 ```
