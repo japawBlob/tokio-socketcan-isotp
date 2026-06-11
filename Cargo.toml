@@ -1,6 +1,6 @@
 [package]
 name = "tokio-socketcan-isotp"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["Jakub Jíra <jakub.jira@protonmail.com>"]
 license = "MIT"
