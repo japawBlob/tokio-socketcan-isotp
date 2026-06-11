@@ -60,12 +60,16 @@
 //! ```
 
 mod addr;
+#[cfg(feature = "isotp-userspace")]
+mod channel;
 mod error;
 #[cfg(target_os = "linux")]
 mod kernel;
 #[cfg(target_os = "linux")]
 mod socketcan_isotp;
 mod types;
+#[cfg(feature = "isotp-userspace")]
+mod userspace;
 
 pub use crate::error::Error;
 pub use crate::types::{
@@ -82,7 +86,9 @@ use std::os::raw::c_int;
 
 enum Inner {
     #[cfg(target_os = "linux")]
-    Kernel(kernel::KernelIsoTp),
+    Kernel(Box<kernel::KernelIsoTp>),
+    #[cfg(feature = "isotp-userspace")]
+    Userspace(userspace::UserspaceIsoTp),
     /// Present so the enum is never empty on builds without any backend
     /// (non-Linux without the `tcp` feature); cannot be constructed.
     #[cfg(not(target_os = "linux"))]
@@ -138,7 +144,9 @@ impl IsoTpSocket {
                         rx_flow_control_options,
                         link_layer_options,
                     )?;
-                    Ok(IsoTpSocket(Inner::Kernel(kernel::KernelIsoTp::new(sock)?)))
+                    Ok(IsoTpSocket(Inner::Kernel(Box::new(
+                        kernel::KernelIsoTp::new(sock)?,
+                    ))))
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
@@ -162,7 +170,9 @@ impl IsoTpSocket {
     #[cfg(target_os = "linux")]
     pub fn open_if(if_index: c_int, src: impl Into<Id>, dst: impl Into<Id>) -> Result<Self, Error> {
         let sock = socketcan_isotp::IsoTpSocket::open_if(if_index, src, dst)?;
-        Ok(IsoTpSocket(Inner::Kernel(kernel::KernelIsoTp::new(sock)?)))
+        Ok(IsoTpSocket(Inner::Kernel(Box::new(
+            kernel::KernelIsoTp::new(sock)?,
+        ))))
     }
 
     /// Open a kernel ISO-TP socket by kernel interface number, passing
@@ -184,7 +194,9 @@ impl IsoTpSocket {
             rx_flow_control_options,
             link_layer_options,
         )?;
-        Ok(IsoTpSocket(Inner::Kernel(kernel::KernelIsoTp::new(sock)?)))
+        Ok(IsoTpSocket(Inner::Kernel(Box::new(
+            kernel::KernelIsoTp::new(sock)?,
+        ))))
     }
 
     /// Write a complete ISO-TP payload.
@@ -192,6 +204,8 @@ impl IsoTpSocket {
         match &self.0 {
             #[cfg(target_os = "linux")]
             Inner::Kernel(sock) => sock.write_packet(packet).await,
+            #[cfg(feature = "isotp-userspace")]
+            Inner::Userspace(sock) => sock.write_packet(packet).await,
             #[cfg(not(target_os = "linux"))]
             Inner::Unsupported(never) => match *never {},
         }
@@ -202,6 +216,8 @@ impl IsoTpSocket {
         match &self.0 {
             #[cfg(target_os = "linux")]
             Inner::Kernel(sock) => sock.read_packet().await,
+            #[cfg(feature = "isotp-userspace")]
+            Inner::Userspace(sock) => sock.read_packet().await,
             #[cfg(not(target_os = "linux"))]
             Inner::Unsupported(never) => match *never {},
         }

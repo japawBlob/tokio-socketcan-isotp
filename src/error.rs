@@ -26,4 +26,9 @@ pub enum Error {
     /// platform.
     #[error("address error: {0}")]
     Address(String),
+
+    /// The requested socket options are not supported by the selected
+    /// backend (e.g. extended addressing on the userspace backends).
+    #[error("unsupported option: {0}")]
+    Unsupported(String),
 }
