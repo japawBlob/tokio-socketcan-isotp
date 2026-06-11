@@ -164,9 +164,9 @@ pub(crate) async fn send(
     let (mut bs, mut stmin) = wait_for_fc(chan, cfg.rx_id).await?;
     let mut sent = 6usize;
     let mut sequence = 1u8;
-    let mut in_block = 0u8;
+    let mut in_block = 0u32;
     while sent < data.len() {
-        if bs != 0 && in_block == bs {
+        if bs != 0 && in_block == u32::from(bs) {
             (bs, stmin) = wait_for_fc(chan, cfg.rx_id).await?;
             in_block = 0;
         }
@@ -230,7 +230,7 @@ async fn recv_segmented(
     chan.send(cfg.frame(&fc)).await?;
 
     let mut sequence = 1u8;
-    let mut in_block = 0u8;
+    let mut in_block = 0u32;
     while buf.len() < total {
         let frame = timeout(N_CR_TIMEOUT, recv_matching(chan, cfg.rx_id))
             .await
@@ -248,7 +248,7 @@ async fn recv_segmented(
         buf.extend_from_slice(&frame.data[1..=take]);
         sequence = (sequence + 1) & 0x0F;
         in_block += 1;
-        if cfg.fc_bs != 0 && in_block == cfg.fc_bs && buf.len() < total {
+        if cfg.fc_bs != 0 && in_block == u32::from(cfg.fc_bs) && buf.len() < total {
             chan.send(cfg.frame(&fc)).await?;
             in_block = 0;
         }
@@ -420,6 +420,20 @@ mod tests {
         for len in [1usize, 6, 7, 8, 13, 62, 4095] {
             round_trip(len).await;
         }
+    }
+
+    #[tokio::test]
+    async fn max_payload_in_one_unlimited_block() {
+        // bs = 0 means a single block of 585 consecutive frames; the block
+        // counter must not overflow (regression: was a u8).
+        let (mut a, mut b) = chan_pair();
+        let cfg_a = config(0x7E0, 0x7E8);
+        let cfg_b = config(0x7E8, 0x7E0);
+        let payload = vec![0x55u8; 4095];
+        let expected = payload.clone();
+        let receiver = tokio::spawn(async move { recv(&mut b, &cfg_b).await.unwrap() });
+        send(&mut a, &cfg_a, &payload).await.unwrap();
+        assert_eq!(receiver.await.unwrap(), expected);
     }
 
     #[tokio::test]

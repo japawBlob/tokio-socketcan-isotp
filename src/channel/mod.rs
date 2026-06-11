@@ -7,6 +7,8 @@
 //! an in-memory pair (tests).
 
 pub(crate) mod mem;
+#[cfg(target_os = "linux")]
+pub(crate) mod rawcan;
 
 use std::io;
 
@@ -37,18 +39,24 @@ impl CanFrame {
 /// not dyn-compatible on our pinned toolchain).
 pub(crate) enum FrameChannel {
     Mem(mem::MemChannel),
+    #[cfg(target_os = "linux")]
+    RawCan(rawcan::RawCanChannel),
 }
 
 impl FrameChannel {
     pub(crate) async fn send(&mut self, frame: CanFrame) -> io::Result<()> {
         match self {
             FrameChannel::Mem(chan) => chan.send(frame),
+            #[cfg(target_os = "linux")]
+            FrameChannel::RawCan(chan) => chan.send(frame).await,
         }
     }
 
     pub(crate) async fn recv(&mut self) -> io::Result<CanFrame> {
         match self {
             FrameChannel::Mem(chan) => chan.recv().await,
+            #[cfg(target_os = "linux")]
+            FrameChannel::RawCan(chan) => chan.recv().await,
         }
     }
 }

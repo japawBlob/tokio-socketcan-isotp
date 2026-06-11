@@ -132,6 +132,8 @@ impl IsoTpSocket {
         rx_flow_control_options: Option<FlowControlOptions>,
         link_layer_options: Option<LinkLayerOptions>,
     ) -> Result<Self, Error> {
+        let src: Id = src.into();
+        let dst: Id = dst.into();
         match addr::parse(address)? {
             addr::Address::Kernel(ifname) => {
                 #[cfg(target_os = "linux")]
@@ -155,9 +157,29 @@ impl IsoTpSocket {
                     )))
                 }
             }
-            addr::Address::RawCan(ifname) => Err(Error::Address(format!(
-                "'rawcan:{ifname}' requires the `isotp-userspace` feature on Linux"
-            ))),
+            addr::Address::RawCan(ifname) => {
+                #[cfg(all(target_os = "linux", feature = "isotp-userspace"))]
+                {
+                    let chan = channel::FrameChannel::RawCan(channel::rawcan::RawCanChannel::open(
+                        ifname, src,
+                    )?);
+                    Ok(IsoTpSocket(Inner::Userspace(
+                        userspace::UserspaceIsoTp::new(
+                            chan,
+                            src,
+                            dst,
+                            isotp_options,
+                            rx_flow_control_options,
+                        )?,
+                    )))
+                }
+                #[cfg(not(all(target_os = "linux", feature = "isotp-userspace")))]
+                {
+                    Err(Error::Address(format!(
+                        "'rawcan:{ifname}' requires the `isotp-userspace` feature on Linux"
+                    )))
+                }
+            }
             addr::Address::TcpConnect(endpoint) | addr::Address::TcpListen(endpoint) => {
                 Err(Error::Address(format!(
                     "'{address}' ('{endpoint}') requires the `tcp` feature"
