@@ -14,12 +14,26 @@ categories = ["network-programming", "os::linux-apis", "asynchronous"]
 [badges]
 maintenance = { status = "actively-developed"}
 
+[features]
+default = []
+# Userspace ISO 15765-2 implementation (segmentation + flow control) running
+# over raw CAN frames. Enables the `rawcan:<ifname>` address scheme on Linux,
+# which only needs CAN_RAW sockets (vcan suffices, no can_isotp module).
+isotp-userspace = []
+# Carry raw CAN frames over TCP instead of a CAN bus. Enables the
+# `tcp:<host>:<port>` and `tcplisten:<addr>:<port>` address schemes on all
+# platforms. The userspace ISO-TP implementation always runs on top.
+tcp = ["isotp-userspace"]
+
 [dependencies]
-futures = "0.3"
-mio = { version = "0.8", features = ["os-ext"] }
-libc = "0.2"
-tokio = { version = "1", features = ["net"] }
+tokio = { version = "1", features = ["net", "sync", "time", "io-util", "rt"] }
 bitflags = "2.4.1"
 embedded-can = "0.4"
-nix = "0.26"
 thiserror = "1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+nix = "0.26"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

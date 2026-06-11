@@ -2,31 +2,52 @@
 #![allow(dead_code)]
 //! # tokio-socketcan-isotp
 //!
-//! This library creates asynchronous wrapper around [socketcan-isotp](https://github.com/marcelbuesing/socketcan-isotp)
+//! Asynchronous ISO-TP (ISO 15765-2) sockets for tokio.
 //!
-//! Currently not dependent on the original, but rather on the modified of the socketcan-isotp libary, which adds read_to_vec method, in order to prevent mutable borrowing of the socket, when reading.
+//! The transport backend is selected at runtime by the interface address
+//! passed to [IsoTpSocket::open] / [IsoTpSocket::open_with_opts]:
 //!
-//! You may experience busy waiting, or soft locks when two consecutive locks. This is due to the error in Linux Kernel, which is now [solved](https://lore.kernel.org/linux-can/20230818114345.142983-1-lukas.magel@posteo.net/), but the maintainer of your Linux kernel might not have shipped it yet. I tested it on the mainline Kernel 6.6.5 and everything worked correctly. If you experience mentioned errors and cannot upgrade to newer kernel, refer to the src/lib.rs file to the poll method of the IsoTpWriteFuture, where a edit is suggested that might help with your situation.
+//! | Address               | Backend                                       | Requires                      |
+//! |-----------------------|-----------------------------------------------|-------------------------------|
+//! | `vcan0`, `can0`, ...  | kernel ISO-TP socket (`can_isotp` module)     | Linux                         |
+//! | `rawcan:vcan0`        | userspace ISO-TP over a `CAN_RAW` socket      | Linux, feature `isotp-userspace` |
+//! | `tcp:host:port`       | userspace ISO-TP over TCP (connect to a hub)  | feature `tcp`                 |
+//! | `tcplisten:addr:port` | userspace ISO-TP over TCP (bind a frame hub)  | feature `tcp`                 |
 //!
-//! The API is provided by the struct [IsoTpSocket]
+//! The kernel backend is the original transport of this crate and implements
+//! the full ISO-TP protocol in the kernel. The userspace backends implement a
+//! subset of ISO 15765-2 (single/first/consecutive frames and flow control
+//! for classic CAN with normal addressing) and exist so that tests and
+//! simulators can run without the `can_isotp` kernel module (`rawcan:`) or
+//! without any CAN support at all (`tcp:`, also available on non-Linux
+//! platforms).
+//!
+//! You may experience busy waiting, or soft locks when two consecutive locks.
+//! This is due to the error in Linux Kernel, which is now
+//! [solved](https://lore.kernel.org/linux-can/20230818114345.142983-1-lukas.magel@posteo.net/),
+//! but the maintainer of your Linux kernel might not have shipped it yet.
+//! If you experience mentioned errors and cannot upgrade to newer kernel,
+//! refer to the src/kernel.rs file to the write_packet method, where an edit
+//! is suggested that might help with your situation.
 //!
 //! Example of basic echoing server on vcan0:
 //!
-//! ```rust
+//! ```rust,no_run
 //! use tokio_socketcan_isotp::{IsoTpSocket, StandardId, Error};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Error> {
-//!    let mut socket = IsoTpSocket::open(
-//!        "vcan0",
-//!        StandardId::new(0x123).expect("Invalid src id"),
-//!        StandardId::new(0x321).expect("Invalid src id")
-//!            )?;
-//!            
-//!     while let Ok(packet) = socket.read_packet()?.await {
+//!     let socket = IsoTpSocket::open(
+//!         "vcan0",
+//!         StandardId::new(0x123).expect("Invalid src id"),
+//!         StandardId::new(0x321).expect("Invalid dst id"),
+//!     )?;
+//!
+//!     while let Ok(packet) = socket.read_packet().await {
 //!         println!("{:?}", packet);
-//!         let rx = socket.write_packet(packet)?.await;
+//!         socket.write_packet(&packet).await?;
 //!     }
+//!     Ok(())
 //! }
 //! ```
 //!
@@ -38,113 +59,115 @@
 //! sudo ip link set up vcan0
 //! ```
 
+mod addr;
+mod error;
+#[cfg(target_os = "linux")]
+mod kernel;
+#[cfg(target_os = "linux")]
 mod socketcan_isotp;
+mod types;
 
-pub use crate::socketcan_isotp::{
-    Error, ExtendedId, FlowControlOptions, Id, IsoTpBehaviour, IsoTpOptions, LinkLayerOptions,
-    StandardId, TxFlags, AF_CAN, CAN_ISOTP, CAN_ISOTP_LL_OPTS, CAN_ISOTP_OPTS, CAN_ISOTP_RECV_FC,
+pub use crate::error::Error;
+pub use crate::types::{
+    ExtendedId, FlowControlOptions, Id, IsoTpBehaviour, IsoTpOptions, LinkLayerOptions, StandardId,
+    TxFlags, AF_CAN, CAN_ISOTP, CAN_ISOTP_LL_OPTS, CAN_ISOTP_OPTS, CAN_ISOTP_RECV_FC,
     CAN_ISOTP_RX_STMIN, CAN_ISOTP_TX_STMIN, CAN_MAX_DLEN, EFF_FLAG, EFF_MASK, ERR_FLAG, ERR_MASK,
     ERR_MASK_ALL, ERR_MASK_NONE, PF_CAN, RECV_BUFFER_SIZE, RTR_FLAG, SFF_MASK, SOL_CAN_BASE,
     SOL_CAN_ISOTP,
 };
-use futures::prelude::*;
-use futures::ready;
+
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::raw::c_int;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::unix::AsyncFd;
 
-/// Future for writing data to IsoTpSocket
-pub struct IsoTpWriteFuture<'a> {
-    socket: &'a IsoTpSocket,
-    packet: &'a [u8],
+enum Inner {
+    #[cfg(target_os = "linux")]
+    Kernel(kernel::KernelIsoTp),
+    /// Present so the enum is never empty on builds without any backend
+    /// (non-Linux without the `tcp` feature); cannot be constructed.
+    #[cfg(not(target_os = "linux"))]
+    Unsupported(std::convert::Infallible),
 }
 
-impl Future for IsoTpWriteFuture<'_> {
-    type Output = io::Result<()>;
+/// An asynchronous ISO-TP socket.
+///
+/// For reading and writing complete ISO-TP payloads use
+/// [IsoTpSocket::read_packet] and [IsoTpSocket::write_packet] respectively.
+pub struct IsoTpSocket(Inner);
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            let mut guard = ready!(self.socket.0.poll_write_ready(cx))?;
-            match self.socket.0.get_ref().write(self.packet) {
-                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                    guard.clear_ready(); // Comment this line if you are on older Kernel and the communication soft-locks
-                    continue;
-                }
-                Ok(_) => return Poll::Ready(Ok(())),
-                Err(err) => return Poll::Ready(Err(err)),
-            }
-        }
-    }
-}
-
-/// Future for reading data from IsoTpSocket
-pub struct IsoTpReadFuture<'a> {
-    socket: &'a IsoTpSocket,
-}
-
-impl Future for IsoTpReadFuture<'_> {
-    type Output = io::Result<Vec<u8>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            let mut ready_guard = ready!(self.socket.0.poll_read_ready(cx))?;
-            match ready_guard.try_io(|inner| inner.get_ref().read_to_vec()) {
-                Ok(result) => return Poll::Ready(result),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-}
-
-/// An asynchronous I/O wrapped socketcan_isotp::IsoTpSocket
-/// For reading and writting to the socket use [IsoTpSocket::read_packet] and [IsoTpSocket::write_packet] respectively.
-pub struct IsoTpSocket(AsyncFd<socketcan_isotp::IsoTpSocket>);
-#[allow(dead_code)]
 impl IsoTpSocket {
-    /// Open a named CAN device such as "vcan0"
-    pub fn open(
-        ifname: &str,
-        src: impl Into<Id>,
-        dst: impl Into<Id>,
-    ) -> Result<IsoTpSocket, socketcan_isotp::Error> {
-        let sock = socketcan_isotp::IsoTpSocket::open(ifname, src, dst)?;
-        sock.set_nonblocking(true)?;
-        Ok(IsoTpSocket(AsyncFd::new(sock)?))
+    /// Open a socket with default options. See the crate documentation for
+    /// the supported address forms (`vcan0`, `rawcan:vcan0`, `tcp:...`).
+    pub fn open(address: &str, src: impl Into<Id>, dst: impl Into<Id>) -> Result<Self, Error> {
+        Self::open_with_opts(
+            address,
+            src,
+            dst,
+            Some(IsoTpOptions::default()),
+            Some(FlowControlOptions::default()),
+            Some(LinkLayerOptions::default()),
+        )
     }
 
+    /// Open a socket, passing additional options.
+    ///
+    /// Backend-specific behavior:
+    /// - kernel backend (plain interface name): all options are handed to the
+    ///   kernel as socket options, exactly as before.
+    /// - userspace backends (`rawcan:`, `tcp:`, `tcplisten:`): see the
+    ///   `isotp-userspace` feature documentation for which options are
+    ///   honored; extended addressing and listen mode are rejected.
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     pub fn open_with_opts(
-        ifname: &str,
+        address: &str,
         src: impl Into<Id>,
         dst: impl Into<Id>,
         isotp_options: Option<IsoTpOptions>,
         rx_flow_control_options: Option<FlowControlOptions>,
         link_layer_options: Option<LinkLayerOptions>,
-    ) -> Result<IsoTpSocket, socketcan_isotp::Error> {
-        let sock = socketcan_isotp::IsoTpSocket::open_with_opts(
-            ifname,
-            src,
-            dst,
-            isotp_options,
-            rx_flow_control_options,
-            link_layer_options,
-        )?;
-        sock.set_nonblocking(true)?;
-        Ok(IsoTpSocket(AsyncFd::new(sock)?))
+    ) -> Result<Self, Error> {
+        match addr::parse(address)? {
+            addr::Address::Kernel(ifname) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let sock = socketcan_isotp::IsoTpSocket::open_with_opts(
+                        ifname,
+                        src,
+                        dst,
+                        isotp_options,
+                        rx_flow_control_options,
+                        link_layer_options,
+                    )?;
+                    Ok(IsoTpSocket(Inner::Kernel(kernel::KernelIsoTp::new(sock)?)))
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Err(Error::Address(format!(
+                        "kernel ISO-TP backend for '{ifname}' is only available on Linux"
+                    )))
+                }
+            }
+            addr::Address::RawCan(ifname) => Err(Error::Address(format!(
+                "'rawcan:{ifname}' requires the `isotp-userspace` feature on Linux"
+            ))),
+            addr::Address::TcpConnect(endpoint) | addr::Address::TcpListen(endpoint) => {
+                Err(Error::Address(format!(
+                    "'{address}' ('{endpoint}') requires the `tcp` feature"
+                )))
+            }
+        }
     }
 
-    /// Open by kernel interface number
-    pub fn open_if(
-        if_index: c_int,
-        src: impl Into<Id>,
-        dst: impl Into<Id>,
-    ) -> Result<IsoTpSocket, socketcan_isotp::Error> {
+    /// Open a kernel ISO-TP socket by kernel interface number.
+    #[cfg(target_os = "linux")]
+    pub fn open_if(if_index: c_int, src: impl Into<Id>, dst: impl Into<Id>) -> Result<Self, Error> {
         let sock = socketcan_isotp::IsoTpSocket::open_if(if_index, src, dst)?;
-        sock.set_nonblocking(true)?;
-        Ok(IsoTpSocket(AsyncFd::new(sock)?))
+        Ok(IsoTpSocket(Inner::Kernel(kernel::KernelIsoTp::new(sock)?)))
     }
 
+    /// Open a kernel ISO-TP socket by kernel interface number, passing
+    /// additional options.
+    #[cfg(target_os = "linux")]
     pub fn open_if_with_opts(
         if_index: c_int,
         src: impl Into<Id>,
@@ -152,7 +175,7 @@ impl IsoTpSocket {
         isotp_options: Option<IsoTpOptions>,
         rx_flow_control_options: Option<FlowControlOptions>,
         link_layer_options: Option<LinkLayerOptions>,
-    ) -> Result<IsoTpSocket, socketcan_isotp::Error> {
+    ) -> Result<Self, Error> {
         let sock = socketcan_isotp::IsoTpSocket::open_if_with_opts(
             if_index,
             src,
@@ -161,18 +184,26 @@ impl IsoTpSocket {
             rx_flow_control_options,
             link_layer_options,
         )?;
-        sock.set_nonblocking(true)?;
-        Ok(IsoTpSocket(AsyncFd::new(sock)?))
+        Ok(IsoTpSocket(Inner::Kernel(kernel::KernelIsoTp::new(sock)?)))
     }
 
-    pub fn write_packet<'a>(&'a self, packet: &'a [u8]) -> IsoTpWriteFuture {
-        IsoTpWriteFuture {
-            socket: self,
-            packet,
+    /// Write a complete ISO-TP payload.
+    pub async fn write_packet(&self, packet: &[u8]) -> io::Result<()> {
+        match &self.0 {
+            #[cfg(target_os = "linux")]
+            Inner::Kernel(sock) => sock.write_packet(packet).await,
+            #[cfg(not(target_os = "linux"))]
+            Inner::Unsupported(never) => match *never {},
         }
     }
 
-    pub fn read_packet(&self) -> IsoTpReadFuture {
-        IsoTpReadFuture { socket: self }
+    /// Read a complete ISO-TP payload.
+    pub async fn read_packet(&self) -> io::Result<Vec<u8>> {
+        match &self.0 {
+            #[cfg(target_os = "linux")]
+            Inner::Kernel(sock) => sock.read_packet().await,
+            #[cfg(not(target_os = "linux"))]
+            Inner::Unsupported(never) => match *never {},
+        }
     }
 }
