@@ -180,10 +180,49 @@ impl IsoTpSocket {
                     )))
                 }
             }
-            addr::Address::TcpConnect(endpoint) | addr::Address::TcpListen(endpoint) => {
-                Err(Error::Address(format!(
-                    "'{address}' ('{endpoint}') requires the `tcp` feature"
-                )))
+            addr::Address::TcpConnect(endpoint) => {
+                #[cfg(feature = "tcp")]
+                {
+                    let chan = channel::FrameChannel::Tcp(channel::tcp::TcpClientChannel::connect(
+                        endpoint,
+                    )?);
+                    Ok(IsoTpSocket(Inner::Userspace(
+                        userspace::UserspaceIsoTp::new(
+                            chan,
+                            src,
+                            dst,
+                            isotp_options,
+                            rx_flow_control_options,
+                        )?,
+                    )))
+                }
+                #[cfg(not(feature = "tcp"))]
+                {
+                    Err(Error::Address(format!(
+                        "'tcp:{endpoint}' requires the `tcp` feature"
+                    )))
+                }
+            }
+            addr::Address::TcpListen(endpoint) => {
+                #[cfg(feature = "tcp")]
+                {
+                    let chan = channel::FrameChannel::Hub(channel::tcp::hub_port(endpoint)?);
+                    Ok(IsoTpSocket(Inner::Userspace(
+                        userspace::UserspaceIsoTp::new(
+                            chan,
+                            src,
+                            dst,
+                            isotp_options,
+                            rx_flow_control_options,
+                        )?,
+                    )))
+                }
+                #[cfg(not(feature = "tcp"))]
+                {
+                    Err(Error::Address(format!(
+                        "'tcplisten:{endpoint}' requires the `tcp` feature"
+                    )))
+                }
             }
         }
     }
@@ -222,6 +261,10 @@ impl IsoTpSocket {
     }
 
     /// Write a complete ISO-TP payload.
+    #[cfg_attr(
+        not(any(target_os = "linux", feature = "isotp-userspace")),
+        allow(unused_variables)
+    )]
     pub async fn write_packet(&self, packet: &[u8]) -> io::Result<()> {
         match &self.0 {
             #[cfg(target_os = "linux")]

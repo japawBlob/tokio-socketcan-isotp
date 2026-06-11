@@ -9,6 +9,8 @@
 pub(crate) mod mem;
 #[cfg(target_os = "linux")]
 pub(crate) mod rawcan;
+#[cfg(feature = "tcp")]
+pub(crate) mod tcp;
 
 use std::io;
 
@@ -41,6 +43,10 @@ pub(crate) enum FrameChannel {
     Mem(mem::MemChannel),
     #[cfg(target_os = "linux")]
     RawCan(rawcan::RawCanChannel),
+    #[cfg(feature = "tcp")]
+    Tcp(tcp::TcpClientChannel),
+    #[cfg(feature = "tcp")]
+    Hub(tcp::HubPort),
 }
 
 impl FrameChannel {
@@ -49,6 +55,10 @@ impl FrameChannel {
             FrameChannel::Mem(chan) => chan.send(frame),
             #[cfg(target_os = "linux")]
             FrameChannel::RawCan(chan) => chan.send(frame).await,
+            #[cfg(feature = "tcp")]
+            FrameChannel::Tcp(chan) => chan.send(frame).await,
+            #[cfg(feature = "tcp")]
+            FrameChannel::Hub(chan) => chan.send(frame).await,
         }
     }
 
@@ -57,6 +67,10 @@ impl FrameChannel {
             FrameChannel::Mem(chan) => chan.recv().await,
             #[cfg(target_os = "linux")]
             FrameChannel::RawCan(chan) => chan.recv().await,
+            #[cfg(feature = "tcp")]
+            FrameChannel::Tcp(chan) => chan.recv().await,
+            #[cfg(feature = "tcp")]
+            FrameChannel::Hub(chan) => chan.recv().await,
         }
     }
 }
