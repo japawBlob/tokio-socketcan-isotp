@@ -7,7 +7,7 @@ mod machine;
 
 use crate::channel::FrameChannel;
 use crate::error::Error;
-use crate::types::{id_to_raw, FlowControlOptions, Id, IsoTpBehaviour, IsoTpOptions};
+use crate::types::{FlowControlOptions, Id, IsoTpBehaviour, IsoTpOptions, id_to_raw};
 use std::io;
 use tokio::sync::Mutex;
 

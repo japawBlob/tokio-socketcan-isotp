@@ -73,11 +73,11 @@ mod userspace;
 
 pub use crate::error::Error;
 pub use crate::types::{
-    ExtendedId, FlowControlOptions, Id, IsoTpBehaviour, IsoTpOptions, LinkLayerOptions, StandardId,
-    TxFlags, AF_CAN, CAN_ISOTP, CAN_ISOTP_LL_OPTS, CAN_ISOTP_OPTS, CAN_ISOTP_RECV_FC,
-    CAN_ISOTP_RX_STMIN, CAN_ISOTP_TX_STMIN, CAN_MAX_DLEN, EFF_FLAG, EFF_MASK, ERR_FLAG, ERR_MASK,
-    ERR_MASK_ALL, ERR_MASK_NONE, PF_CAN, RECV_BUFFER_SIZE, RTR_FLAG, SFF_MASK, SOL_CAN_BASE,
-    SOL_CAN_ISOTP,
+    AF_CAN, CAN_ISOTP, CAN_ISOTP_LL_OPTS, CAN_ISOTP_OPTS, CAN_ISOTP_RECV_FC, CAN_ISOTP_RX_STMIN,
+    CAN_ISOTP_TX_STMIN, CAN_MAX_DLEN, EFF_FLAG, EFF_MASK, ERR_FLAG, ERR_MASK, ERR_MASK_ALL,
+    ERR_MASK_NONE, ExtendedId, FlowControlOptions, Id, IsoTpBehaviour, IsoTpOptions,
+    LinkLayerOptions, PF_CAN, RECV_BUFFER_SIZE, RTR_FLAG, SFF_MASK, SOL_CAN_BASE, SOL_CAN_ISOTP,
+    StandardId, TxFlags,
 };
 
 use std::io;

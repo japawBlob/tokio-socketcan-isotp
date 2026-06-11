@@ -17,12 +17,12 @@
 
 use crate::error::Error;
 use crate::types::{
-    id_to_raw, FlowControlOptions, Id, IsoTpOptions, LinkLayerOptions, AF_CAN, CAN_ISOTP,
-    CAN_ISOTP_LL_OPTS, CAN_ISOTP_OPTS, CAN_ISOTP_RECV_FC, RECV_BUFFER_SIZE, SOL_CAN_ISOTP,
+    AF_CAN, CAN_ISOTP, CAN_ISOTP_LL_OPTS, CAN_ISOTP_OPTS, CAN_ISOTP_RECV_FC, FlowControlOptions,
+    Id, IsoTpOptions, LinkLayerOptions, RECV_BUFFER_SIZE, SOL_CAN_ISOTP, id_to_raw,
 };
 use libc::{
-    bind, c_int, c_short, c_void, close, fcntl, read, setsockopt, sockaddr, socket, write, F_GETFL,
-    F_SETFL, O_NONBLOCK, SOCK_DGRAM,
+    F_GETFL, F_SETFL, O_NONBLOCK, SOCK_DGRAM, bind, c_int, c_short, c_void, close, fcntl, read,
+    setsockopt, sockaddr, socket, write,
 };
 use nix::net::if_::if_nametoindex;
 use std::convert::TryInto;

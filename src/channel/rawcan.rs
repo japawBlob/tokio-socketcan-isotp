@@ -7,7 +7,7 @@
 
 use super::CanFrame;
 use crate::error::Error;
-use crate::types::{id_to_raw, Id};
+use crate::types::{Id, id_to_raw};
 use nix::net::if_::if_nametoindex;
 use std::io;
 use std::mem::size_of;
