@@ -45,6 +45,7 @@ The backend is selected at runtime by the address string passed to
 | `rawcan:vcan0`        | userspace ISO-TP over a `CAN_RAW` socket       | Linux, feature `isotp-userspace` |
 | `tcp:host:port`       | userspace ISO-TP over TCP (connect to a hub)   | feature `tcp`                    |
 | `tcplisten:addr:port` | userspace ISO-TP over TCP (bind a frame hub)   | feature `tcp`                    |
+| `socketcand:host:port:bus` | userspace ISO-TP over a socketcand daemon | feature `socketcand`          |
 
 - `isotp-userspace` implements an ISO 15765-2 subset (SF/FF/CF/FC, block
   size and STmin pacing, N_Bs/N_Cr timeouts, TX padding, 11/29-bit ids,
@@ -60,3 +61,10 @@ The backend is selected at runtime by the address string passed to
   (no echo to the sender). Each TCP message is exactly 16 bytes: u32 LE
   can_id (bit 31 = 29-bit id flag), u8 data length, 3 reserved zero
   bytes, 8 data bytes - see `src/channel/tcp.rs`.
+- `socketcand` (implies `isotp-userspace`) connects to a
+  [socketcand](https://github.com/linux-can/socketcand) daemon in rawmode
+  over TCP and works on all platforms. After the `< hi >` / `< open <bus> >`
+  / `< rawmode >` handshake, frames are exchanged as the daemon's ASCII
+  `< frame ... >` / `< send ... >` messages - see
+  `src/channel/socketcand.rs`. Useful when the CAN bus lives on another host
+  or in a container the client cannot attach to directly.

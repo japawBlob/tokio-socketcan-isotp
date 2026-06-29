@@ -1,6 +1,6 @@
 [package]
 name = "tokio-socketcan-isotp"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["Jakub Jíra <jakub.jira@protonmail.com>"]
 license = "MIT"
@@ -24,6 +24,10 @@ isotp-userspace = []
 # `tcp:<host>:<port>` and `tcplisten:<addr>:<port>` address schemes on all
 # platforms. The userspace ISO-TP implementation always runs on top.
 tcp = ["isotp-userspace"]
+# Carry raw CAN frames over a socketcand daemon (rawmode). Enables the
+# `socketcand:<host>:<port>:<bus>` address scheme on all platforms. The
+# userspace ISO-TP implementation always runs on top.
+socketcand = ["isotp-userspace"]
 
 [dependencies]
 tokio = { version = "1", features = ["net", "sync", "time", "io-util", "rt"] }

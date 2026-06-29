@@ -8,6 +8,7 @@
 //! | `rawcan:vcan0`             | userspace ISO-TP over a `CAN_RAW` socket     |
 //! | `tcp:host:port`            | userspace ISO-TP over TCP (connect)          |
 //! | `tcplisten:addr:port`      | userspace ISO-TP over TCP (listen, frame hub)|
+//! | `socketcand:host:port:bus` | userspace ISO-TP over a socketcand daemon    |
 //!
 //! Plain interface names must not contain `:`; anything containing a `:`
 //! that does not match a known scheme is rejected so that typos fail loudly
@@ -26,6 +27,9 @@ pub(crate) enum Address<'a> {
     /// `tcplisten:<addr>:<port>`: userspace ISO-TP attached to a local
     /// TCP frame hub which accepts client connections.
     TcpListen(&'a str),
+    /// `socketcand:<host>:<port>:<bus>`: userspace ISO-TP over a socketcand
+    /// daemon connection in rawmode.
+    Socketcand { endpoint: &'a str, bus: &'a str },
 }
 
 pub(crate) fn parse(address: &str) -> Result<Address<'_>, Error> {
@@ -45,6 +49,18 @@ pub(crate) fn parse(address: &str) -> Result<Address<'_>, Error> {
         }
         return Ok(Address::TcpListen(endpoint));
     }
+    if let Some(rest) = address.strip_prefix("socketcand:") {
+        // `host:port:bus` - the bus name is the final `:`-separated token.
+        let (endpoint, bus) = rest
+            .rsplit_once(':')
+            .filter(|(endpoint, bus)| !endpoint.is_empty() && !bus.is_empty())
+            .ok_or_else(|| {
+                Error::Address(format!(
+                    "expected 'socketcand:<host>:<port>:<bus>' in '{address}'"
+                ))
+            })?;
+        return Ok(Address::Socketcand { endpoint, bus });
+    }
     if let Some(endpoint) = address.strip_prefix("tcp:") {
         if endpoint.is_empty() {
             return Err(Error::Address(format!("missing host:port in '{address}'")));
@@ -55,7 +71,8 @@ pub(crate) fn parse(address: &str) -> Result<Address<'_>, Error> {
         return Err(Error::Address(format!(
             "unknown transport scheme in '{address}' \
              (expected a plain interface name, 'rawcan:<ifname>', \
-             'tcp:<host>:<port>' or 'tcplisten:<addr>:<port>')"
+             'tcp:<host>:<port>', 'tcplisten:<addr>:<port>' or \
+             'socketcand:<host>:<port>:<bus>')"
         )));
     }
     Ok(Address::Kernel(address))
@@ -88,10 +105,23 @@ mod tests {
     }
 
     #[test]
+    fn socketcand_scheme() {
+        assert_eq!(
+            parse("socketcand:127.0.0.1:29536:vcan0").unwrap(),
+            Address::Socketcand {
+                endpoint: "127.0.0.1:29536",
+                bus: "vcan0"
+            }
+        );
+    }
+
+    #[test]
     fn unknown_scheme_is_rejected() {
         assert!(parse("udp:127.0.0.1:9800").is_err());
         assert!(parse("rawcan:").is_err());
         assert!(parse("tcp:").is_err());
         assert!(parse("tcplisten:").is_err());
+        assert!(parse("socketcand:").is_err());
+        assert!(parse("socketcand:vcan0").is_err());
     }
 }

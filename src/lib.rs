@@ -224,6 +224,29 @@ impl IsoTpSocket {
                     )))
                 }
             }
+            addr::Address::Socketcand { endpoint, bus } => {
+                #[cfg(feature = "socketcand")]
+                {
+                    let chan = channel::FrameChannel::Socketcand(
+                        channel::socketcand::SocketcandChannel::connect(endpoint, bus)?,
+                    );
+                    Ok(IsoTpSocket(Inner::Userspace(
+                        userspace::UserspaceIsoTp::new(
+                            chan,
+                            src,
+                            dst,
+                            isotp_options,
+                            rx_flow_control_options,
+                        )?,
+                    )))
+                }
+                #[cfg(not(feature = "socketcand"))]
+                {
+                    Err(Error::Address(format!(
+                        "'socketcand:{endpoint}:{bus}' requires the `socketcand` feature"
+                    )))
+                }
+            }
         }
     }
 
