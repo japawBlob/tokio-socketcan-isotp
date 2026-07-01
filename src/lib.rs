@@ -228,7 +228,7 @@ impl IsoTpSocket {
                 #[cfg(feature = "socketcand")]
                 {
                     let chan = channel::FrameChannel::Socketcand(
-                        channel::socketcand::SocketcandChannel::connect(endpoint, bus)?,
+                        channel::socketcand::socketcand_port(endpoint, bus)?,
                     );
                     Ok(IsoTpSocket(Inner::Userspace(
                         userspace::UserspaceIsoTp::new(

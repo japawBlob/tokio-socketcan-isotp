@@ -1,6 +1,6 @@
 [package]
 name = "tokio-socketcan-isotp"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["Jakub Jíra <jakub.jira@protonmail.com>"]
 license = "MIT"
@@ -30,7 +30,7 @@ tcp = ["isotp-userspace"]
 socketcand = ["isotp-userspace"]
 
 [dependencies]
-tokio = { version = "1", features = ["net", "sync", "time", "io-util", "rt"] }
+tokio = { version = "1", features = ["net", "sync", "time", "io-util", "rt", "macros"] }
 bitflags = "2.4.1"
 embedded-can = "0.4"
 thiserror = "1.0"

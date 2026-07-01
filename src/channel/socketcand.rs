@@ -3,6 +3,18 @@
 //! directly. Enables the `socketcand:<host>:<port>:<bus>` address scheme on
 //! all platforms; the userspace ISO-TP implementation always runs on top.
 //!
+//! # Topology
+//!
+//! A userspace ISO-TP socket is opened per transaction, but socketcand is a
+//! TCP connection with a handshake - reconnecting per transaction (and per
+//! functional keep-alive) churns short-lived connections, which under load
+//! ties up the runtime and trips intermittent DNS failures. Instead this
+//! backend keeps **one persistent, shared connection per
+//! `host:port:bus` endpoint** (process-global, like the `tcp:` frame hub) and
+//! fans every received frame out to all attached ports; each port's userspace
+//! ISO-TP machine filters by its own rx id. Opening/closing an ISO-TP socket
+//! only registers/deregisters a port - no I/O, no handshake.
+//!
 //! # Protocol
 //!
 //! socketcand speaks a line-less ASCII protocol where every message is framed
@@ -24,10 +36,14 @@
 
 use super::CanFrame;
 use crate::error::Error;
+use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 
 /// `CAN_EFF_FLAG`: bit 31 marks a 29-bit extended id in [CanFrame::can_id].
 const EFF_FLAG: u32 = 0x8000_0000;
@@ -35,97 +51,222 @@ const EFF_FLAG: u32 = 0x8000_0000;
 const EFF_MASK: u32 = 0x1fff_ffff;
 /// Largest 11-bit standard id.
 const SFF_MAX: u32 = 0x7ff;
+/// Longest backoff between reconnect attempts.
+const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
-/// A client connection to a socketcand daemon
-/// (`socketcand:<host>:<port>:<bus>`).
+/// Shared, persistent connection to one socketcand endpoint. Received frames
+/// are broadcast to every attached port; outbound frames from all ports are
+/// multiplexed onto the single connection.
+struct SocketcandConn {
+    ports: Mutex<HashMap<u64, mpsc::UnboundedSender<CanFrame>>>,
+    next_id: AtomicU64,
+    /// Outbound frames from all ports, drained by the connection task.
+    out_tx: mpsc::UnboundedSender<CanFrame>,
+}
+
+impl SocketcandConn {
+    fn register(&self) -> (u64, mpsc::UnboundedReceiver<CanFrame>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.ports.lock().unwrap().insert(id, tx);
+        (id, rx)
+    }
+
+    fn deregister(&self, id: u64) {
+        self.ports.lock().unwrap().remove(&id);
+    }
+
+    fn broadcast(&self, frame: CanFrame) {
+        let ports = self.ports.lock().unwrap();
+        for tx in ports.values() {
+            // A closed receiver is cleaned up when its port is dropped.
+            let _ = tx.send(frame);
+        }
+    }
+}
+
+/// Connections are keyed by `endpoint|bus` and live for the rest of the
+/// process, so short-lived per-transaction sockets don't reconnect.
+static CONNS: OnceLock<Mutex<HashMap<String, Arc<SocketcandConn>>>> = OnceLock::new();
+
+/// A port on the shared socketcand connection (`socketcand:<host>:<port>:<bus>`).
 pub(crate) struct SocketcandChannel {
-    rd: OwnedReadHalf,
-    wr: OwnedWriteHalf,
-    /// Bytes received but not yet parsed into a complete `< ... >` message.
-    rx_buf: Vec<u8>,
+    conn: Arc<SocketcandConn>,
+    id: u64,
+    rx: mpsc::UnboundedReceiver<CanFrame>,
 }
 
 impl SocketcandChannel {
-    /// Connect to the daemon at `endpoint` (`host:port`) and open `bus` in
-    /// rawmode. The connect and handshake use blocking I/O (accepted, like the
-    /// `tcp:` backend, for a short-lived control path) before the socket is
-    /// handed to tokio. Must be called from within a tokio runtime.
-    pub(crate) fn connect(endpoint: &str, bus: &str) -> Result<Self, Error> {
-        use std::io::Write;
-
-        let mut stream = std::net::TcpStream::connect(endpoint)?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-
-        // Greeting.
-        let greeting = read_message_blocking(&mut stream)?;
-        if greeting != "hi" {
-            return Err(Error::Address(format!(
-                "unexpected socketcand greeting from {endpoint}: '{greeting}'"
-            )));
-        }
-
-        // Open the bus and confirm.
-        stream.write_all(format!("< open {bus} >").as_bytes())?;
-        let resp = read_message_blocking(&mut stream)?;
-        if resp != "ok" {
-            return Err(Error::Address(format!(
-                "socketcand at {endpoint} did not accept bus '{bus}': '{resp}'"
-            )));
-        }
-
-        // Switch to rawmode. Some daemon versions reply `< ok >` here and some
-        // do not; rather than block on a reply that may never come, we let the
-        // async receive path skip any stray non-frame message.
-        stream.write_all(b"< rawmode >")?;
-
-        stream.set_read_timeout(None)?;
-        stream.set_nonblocking(true)?;
-        let stream = tokio::net::TcpStream::from_std(stream)?;
-        let (rd, wr) = stream.into_split();
-        Ok(SocketcandChannel {
-            rd,
-            wr,
-            rx_buf: Vec::new(),
-        })
-    }
-
     pub(crate) async fn send(&mut self, frame: CanFrame) -> io::Result<()> {
-        self.wr.write_all(encode_send(frame).as_bytes()).await
+        self.conn
+            .out_tx
+            .send(frame)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "socketcand connection closed"))
     }
 
     pub(crate) async fn recv(&mut self) -> io::Result<CanFrame> {
+        self.rx.recv().await.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "socketcand connection closed")
+        })
+    }
+}
+
+impl Drop for SocketcandChannel {
+    fn drop(&mut self) {
+        self.conn.deregister(self.id);
+    }
+}
+
+/// Attach a port to the shared connection for `endpoint` (`host:port`) / `bus`,
+/// spawning the connection task on first use. Must be called from within a
+/// tokio runtime.
+pub(crate) fn socketcand_port(endpoint: &str, bus: &str) -> Result<SocketcandChannel, Error> {
+    let key = format!("{endpoint}|{bus}");
+    let conns = CONNS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = conns.lock().unwrap();
+    let conn = match map.get(&key) {
+        Some(conn) => Arc::clone(conn),
+        None => {
+            let (out_tx, out_rx) = mpsc::unbounded_channel();
+            let conn = Arc::new(SocketcandConn {
+                ports: Mutex::new(HashMap::new()),
+                next_id: AtomicU64::new(0),
+                out_tx,
+            });
+            tokio::spawn(run_connection(
+                endpoint.to_owned(),
+                bus.to_owned(),
+                out_rx,
+                Arc::clone(&conn),
+            ));
+            map.insert(key, Arc::clone(&conn));
+            conn
+        }
+    };
+    let (id, rx) = conn.register();
+    Ok(SocketcandChannel { conn, id, rx })
+}
+
+/// Owns the socketcand TCP connection: (re)connects with backoff, broadcasts
+/// received frames to the ports, and writes outbound frames. Runs for the life
+/// of the process.
+async fn run_connection(
+    endpoint: String,
+    bus: String,
+    mut out_rx: mpsc::UnboundedReceiver<CanFrame>,
+    conn: Arc<SocketcandConn>,
+) {
+    let mut attempt: u32 = 0;
+    loop {
+        let stream = match connect(&endpoint, &bus).await {
+            Ok(stream) => {
+                attempt = 0;
+                stream
+            }
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                let delay = RECONNECT_MAX.min(Duration::from_millis(500) * (1 << attempt.min(4)));
+                tokio::time::sleep(delay).await;
+                let _ = &e;
+                continue;
+            }
+        };
+
+        let (mut rd, mut wr) = stream.into_split();
+        let mut rx_buf: Vec<u8> = Vec::new();
+        let mut read_buf = [0u8; 1024];
         loop {
-            // Drain any already-buffered messages first.
-            while let Some(msg) = self.take_message() {
-                if let Some(frame) = parse_frame(&msg) {
-                    return Ok(frame);
-                }
-                // Non-frame message (`ok`, `hi`, `error ...`): skip it.
+            tokio::select! {
+                read = rd.read(&mut read_buf) => match read {
+                    Ok(0) | Err(_) => break, // connection closed; reconnect
+                    Ok(n) => {
+                        rx_buf.extend_from_slice(&read_buf[..n]);
+                        while let Some(msg) = take_message(&mut rx_buf) {
+                            if let Some(frame) = parse_frame(&msg) {
+                                conn.broadcast(frame);
+                            }
+                        }
+                    }
+                },
+                frame = out_rx.recv() => match frame {
+                    None => return, // all ports and the registry are gone
+                    Some(frame) => {
+                        if wr.write_all(encode_send(frame).as_bytes()).await.is_err() {
+                            break; // write failed; reconnect
+                        }
+                    }
+                },
             }
-            let mut tmp = [0u8; 1024];
-            let n = self.rd.read(&mut tmp).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    "socketcand connection closed",
-                ));
-            }
-            self.rx_buf.extend_from_slice(&tmp[..n]);
         }
     }
+}
 
-    /// Pop the next complete `< ... >` message from [Self::rx_buf], returning
-    /// its trimmed inner content, or `None` if no complete message is buffered.
-    fn take_message(&mut self) -> Option<String> {
-        let start = self.rx_buf.iter().position(|&b| b == b'<')?;
-        let end = self.rx_buf[start..].iter().position(|&b| b == b'>')? + start;
-        let inner = String::from_utf8_lossy(&self.rx_buf[start + 1..end])
-            .trim()
-            .to_owned();
-        self.rx_buf.drain(..=end);
-        Some(inner)
+/// Connect to `endpoint` and complete the rawmode handshake for `bus`. Uses
+/// async I/O throughout, so a slow or failing DNS lookup never blocks the
+/// runtime.
+async fn connect(endpoint: &str, bus: &str) -> Result<TcpStream, Error> {
+    let mut stream = TcpStream::connect(endpoint).await?;
+    stream.set_nodelay(true)?;
+
+    let greeting = read_message(&mut stream).await?;
+    if greeting != "hi" {
+        return Err(Error::Address(format!(
+            "unexpected socketcand greeting from {endpoint}: '{greeting}'"
+        )));
     }
+    stream
+        .write_all(format!("< open {bus} >").as_bytes())
+        .await?;
+    let resp = read_message(&mut stream).await?;
+    if resp != "ok" {
+        return Err(Error::Address(format!(
+            "socketcand at {endpoint} did not accept bus '{bus}': '{resp}'"
+        )));
+    }
+    // Switch to rawmode. Some daemons reply `< ok >`, some do not; the frame
+    // reader skips any stray non-frame message, so we don't wait for it.
+    stream.write_all(b"< rawmode >").await?;
+    Ok(stream)
+}
+
+/// Read one complete `< ... >` message, returning its trimmed inner content.
+/// Reads a byte at a time so it never consumes past the closing `>`.
+async fn read_message(stream: &mut TcpStream) -> Result<String, Error> {
+    let mut inner = Vec::new();
+    let mut started = false;
+    let mut byte = [0u8; 1];
+    loop {
+        if stream.read(&mut byte).await? == 0 {
+            return Err(Error::Io {
+                source: io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "socketcand closed during handshake",
+                ),
+            });
+        }
+        match byte[0] {
+            b'<' => {
+                started = true;
+                inner.clear();
+            }
+            b'>' if started => break,
+            b if started => inner.push(b),
+            _ => {}
+        }
+    }
+    Ok(String::from_utf8_lossy(&inner).trim().to_owned())
+}
+
+/// Pop the next complete `< ... >` message from `buf`, returning its trimmed
+/// inner content, or `None` if no complete message is buffered.
+fn take_message(buf: &mut Vec<u8>) -> Option<String> {
+    let start = buf.iter().position(|&b| b == b'<')?;
+    let end = buf[start..].iter().position(|&b| b == b'>')? + start;
+    let inner = String::from_utf8_lossy(&buf[start + 1..end])
+        .trim()
+        .to_owned();
+    buf.drain(..=end);
+    Some(inner)
 }
 
 /// Render a `< send ... >` message for `frame`.
@@ -181,37 +322,6 @@ fn parse_frame(msg: &str) -> Option<CanFrame> {
     Some(CanFrame::new(can_id, &data))
 }
 
-/// Read exactly one `< ... >` message from a blocking stream, returning the
-/// trimmed inner content. Reads a byte at a time so it never consumes past the
-/// closing `>` (which would strand frame bytes the async path needs).
-fn read_message_blocking(stream: &mut std::net::TcpStream) -> Result<String, Error> {
-    use std::io::Read;
-
-    let mut inner = Vec::new();
-    let mut started = false;
-    let mut byte = [0u8; 1];
-    loop {
-        if stream.read(&mut byte)? == 0 {
-            return Err(Error::Io {
-                source: io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "socketcand closed during handshake",
-                ),
-            });
-        }
-        match byte[0] {
-            b'<' => {
-                started = true;
-                inner.clear();
-            }
-            b'>' if started => break,
-            b if started => inner.push(b),
-            _ => {}
-        }
-    }
-    Ok(String::from_utf8_lossy(&inner).trim().to_owned())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,10 +368,11 @@ mod tests {
         assert!(parse_frame("error unknown command").is_none());
     }
 
-    /// Drive [SocketcandChannel] against a minimal mock daemon: greeting, bus
-    /// open, rawmode, then a pushed frame and a sent frame.
+    /// Drive [socketcand_port] against a minimal mock daemon: greeting, bus
+    /// open, rawmode, then a pushed frame delivered to the port and a frame
+    /// sent from the port reaching the daemon. Two ports share one connection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn handshake_and_roundtrip() {
+    async fn shared_connection_roundtrip() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -278,7 +389,7 @@ mod tests {
             let n = sock.read(&mut buf).await.unwrap();
             assert_eq!(String::from_utf8_lossy(&buf[..n]).trim(), "< rawmode >");
 
-            // Push a frame to the client, then read the client's send.
+            // Push a frame (broadcast to all ports), then read a port's send.
             sock.write_all(b"< frame 708 1.0 62F18601 >").await.unwrap();
             let n = sock.read(&mut buf).await.unwrap();
             assert_eq!(
@@ -288,17 +399,19 @@ mod tests {
         });
 
         let endpoint = format!("{}:{}", addr.ip(), addr.port());
-        let mut chan =
-            tokio::task::spawn_blocking(move || SocketcandChannel::connect(&endpoint, "vcan0"))
-                .await
-                .unwrap()
-                .unwrap();
+        let mut port_a = socketcand_port(&endpoint, "vcan0").unwrap();
+        let mut port_b = socketcand_port(&endpoint, "vcan0").unwrap();
 
-        let frame = chan.recv().await.unwrap();
-        assert_eq!(frame.can_id, 0x708);
-        assert_eq!(&frame.data[..frame.len as usize], &[0x62, 0xF1, 0x86, 0x01]);
+        // Both ports receive the broadcast frame.
+        let a = port_a.recv().await.unwrap();
+        let b = port_b.recv().await.unwrap();
+        assert_eq!(a.can_id, 0x708);
+        assert_eq!(b.can_id, 0x708);
+        assert_eq!(&a.data[..a.len as usize], &[0x62, 0xF1, 0x86, 0x01]);
 
-        chan.send(CanFrame::new(0x700, &[0x02, 0x10, 0x03]))
+        // A send from one port reaches the daemon over the shared connection.
+        port_a
+            .send(CanFrame::new(0x700, &[0x02, 0x10, 0x03]))
             .await
             .unwrap();
 
