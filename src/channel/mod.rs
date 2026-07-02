@@ -2,17 +2,14 @@
 //!
 //! A [FrameChannel] moves classic CAN 2.0 frames (up to 8 data bytes)
 //! between the local ISO-TP state machine and a peer. Backends are selected
-//! by the address scheme: a raw SocketCAN socket (`rawcan:`), a TCP client
-//! connection (`tcp:`), a port on a local TCP frame hub (`tcplisten:`), a
-//! socketcand daemon (`socketcand:`), or an in-memory pair (tests).
+//! by the address scheme: a raw SocketCAN socket (`rawcan:`), a socketcand
+//! daemon (`socketcand:`), or an in-memory pair (tests).
 
 pub(crate) mod mem;
 #[cfg(target_os = "linux")]
 pub(crate) mod rawcan;
 #[cfg(feature = "socketcand")]
 pub(crate) mod socketcand;
-#[cfg(feature = "tcp")]
-pub(crate) mod tcp;
 
 use std::io;
 
@@ -45,10 +42,6 @@ pub(crate) enum FrameChannel {
     Mem(mem::MemChannel),
     #[cfg(target_os = "linux")]
     RawCan(rawcan::RawCanChannel),
-    #[cfg(feature = "tcp")]
-    Tcp(tcp::TcpClientChannel),
-    #[cfg(feature = "tcp")]
-    Hub(tcp::HubPort),
     #[cfg(feature = "socketcand")]
     Socketcand(socketcand::SocketcandChannel),
 }
@@ -59,10 +52,6 @@ impl FrameChannel {
             FrameChannel::Mem(chan) => chan.send(frame),
             #[cfg(target_os = "linux")]
             FrameChannel::RawCan(chan) => chan.send(frame).await,
-            #[cfg(feature = "tcp")]
-            FrameChannel::Tcp(chan) => chan.send(frame).await,
-            #[cfg(feature = "tcp")]
-            FrameChannel::Hub(chan) => chan.send(frame).await,
             #[cfg(feature = "socketcand")]
             FrameChannel::Socketcand(chan) => chan.send(frame).await,
         }
@@ -73,10 +62,6 @@ impl FrameChannel {
             FrameChannel::Mem(chan) => chan.recv().await,
             #[cfg(target_os = "linux")]
             FrameChannel::RawCan(chan) => chan.recv().await,
-            #[cfg(feature = "tcp")]
-            FrameChannel::Tcp(chan) => chan.recv().await,
-            #[cfg(feature = "tcp")]
-            FrameChannel::Hub(chan) => chan.recv().await,
             #[cfg(feature = "socketcand")]
             FrameChannel::Socketcand(chan) => chan.recv().await,
         }

@@ -1,6 +1,6 @@
 [package]
 name = "tokio-socketcan-isotp"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 authors = ["Jakub Jíra <jakub.jira@protonmail.com>"]
 license = "MIT"
@@ -20,10 +20,6 @@ default = []
 # over raw CAN frames. Enables the `rawcan:<ifname>` address scheme on Linux,
 # which only needs CAN_RAW sockets (vcan suffices, no can_isotp module).
 isotp-userspace = []
-# Carry raw CAN frames over TCP instead of a CAN bus. Enables the
-# `tcp:<host>:<port>` and `tcplisten:<addr>:<port>` address schemes on all
-# platforms. The userspace ISO-TP implementation always runs on top.
-tcp = ["isotp-userspace"]
 # Carry raw CAN frames over a socketcand daemon (rawmode). Enables the
 # `socketcand:<host>:<port>:<bus>` address scheme on all platforms. The
 # userspace ISO-TP implementation always runs on top.

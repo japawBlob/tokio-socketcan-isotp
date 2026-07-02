@@ -11,16 +11,15 @@
 //! |-----------------------|-----------------------------------------------|-------------------------------|
 //! | `vcan0`, `can0`, ...  | kernel ISO-TP socket (`can_isotp` module)     | Linux                         |
 //! | `rawcan:vcan0`        | userspace ISO-TP over a `CAN_RAW` socket      | Linux, feature `isotp-userspace` |
-//! | `tcp:host:port`       | userspace ISO-TP over TCP (connect to a hub)  | feature `tcp`                 |
-//! | `tcplisten:addr:port` | userspace ISO-TP over TCP (bind a frame hub)  | feature `tcp`                 |
+//! | `socketcand:host:port:bus` | userspace ISO-TP over a socketcand daemon | feature `socketcand`          |
 //!
 //! The kernel backend is the original transport of this crate and implements
 //! the full ISO-TP protocol in the kernel. The userspace backends implement a
 //! subset of ISO 15765-2 (single/first/consecutive frames and flow control
 //! for classic CAN with normal addressing) and exist so that tests and
 //! simulators can run without the `can_isotp` kernel module (`rawcan:`) or
-//! without any CAN support at all (`tcp:`, also available on non-Linux
-//! platforms).
+//! without any local CAN support at all (`socketcand:`, which reaches a bus
+//! over TCP and is also available on non-Linux platforms).
 //!
 //! You may experience busy waiting, or soft locks when two consecutive locks.
 //! This is due to the error in Linux Kernel, which is now
@@ -120,7 +119,7 @@ impl IsoTpSocket {
     /// Backend-specific behavior:
     /// - kernel backend (plain interface name): all options are handed to the
     ///   kernel as socket options, exactly as before.
-    /// - userspace backends (`rawcan:`, `tcp:`, `tcplisten:`): see the
+    /// - userspace backends (`rawcan:`, `socketcand:`): see the
     ///   `isotp-userspace` feature documentation for which options are
     ///   honored; extended addressing and listen mode are rejected.
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
@@ -177,50 +176,6 @@ impl IsoTpSocket {
                 {
                     Err(Error::Address(format!(
                         "'rawcan:{ifname}' requires the `isotp-userspace` feature on Linux"
-                    )))
-                }
-            }
-            addr::Address::TcpConnect(endpoint) => {
-                #[cfg(feature = "tcp")]
-                {
-                    let chan = channel::FrameChannel::Tcp(channel::tcp::TcpClientChannel::connect(
-                        endpoint,
-                    )?);
-                    Ok(IsoTpSocket(Inner::Userspace(
-                        userspace::UserspaceIsoTp::new(
-                            chan,
-                            src,
-                            dst,
-                            isotp_options,
-                            rx_flow_control_options,
-                        )?,
-                    )))
-                }
-                #[cfg(not(feature = "tcp"))]
-                {
-                    Err(Error::Address(format!(
-                        "'tcp:{endpoint}' requires the `tcp` feature"
-                    )))
-                }
-            }
-            addr::Address::TcpListen(endpoint) => {
-                #[cfg(feature = "tcp")]
-                {
-                    let chan = channel::FrameChannel::Hub(channel::tcp::hub_port(endpoint)?);
-                    Ok(IsoTpSocket(Inner::Userspace(
-                        userspace::UserspaceIsoTp::new(
-                            chan,
-                            src,
-                            dst,
-                            isotp_options,
-                            rx_flow_control_options,
-                        )?,
-                    )))
-                }
-                #[cfg(not(feature = "tcp"))]
-                {
-                    Err(Error::Address(format!(
-                        "'tcplisten:{endpoint}' requires the `tcp` feature"
                     )))
                 }
             }
