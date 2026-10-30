@@ -326,7 +326,37 @@ impl LinkLayerOptions {
             tx_flags,
         }
     }
+
+    /// Link layer options for CAN FD: `CANFD_MTU` frames carrying up to
+    /// `tx_dl` bytes (8, 12, 16, 20, 24, 32, 48 or 64), with `tx_flags`
+    /// (e.g. [TxFlags::CANFD_BRS]).
+    pub fn can_fd(tx_dl: u8, tx_flags: TxFlags) -> Self {
+        Self::new(CANFD_MTU, tx_dl, tx_flags)
+    }
+
+    /// generated & accepted CAN frame type (16 = CAN 2.0, 72 = CAN FD)
+    pub fn get_mtu(&self) -> u8 {
+        self.mtu
+    }
+
+    /// tx link layer data length in bytes
+    pub fn get_tx_dl(&self) -> u8 {
+        self.tx_dl
+    }
+
+    /// flags set into transmitted CAN FD frames
+    pub fn get_tx_flags(&self) -> TxFlags {
+        TxFlags::from_bits_truncate(self.tx_flags)
+    }
+
+    /// Whether these options select CAN FD frames.
+    pub fn is_can_fd(&self) -> bool {
+        self.mtu == CANFD_MTU
+    }
 }
+
+/// `CANFD_MTU`: size of `struct canfd_frame`.
+pub const CANFD_MTU: u8 = 72;
 
 impl Default for LinkLayerOptions {
     fn default() -> Self {

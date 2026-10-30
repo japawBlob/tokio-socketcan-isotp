@@ -33,8 +33,20 @@
 //! (space-separated lowercase hex bytes). 11-bit ids are written as up to
 //! three hex digits, 29-bit ids zero-padded to eight - matching how socketcand
 //! distinguishes standard from extended frames.
+//!
+//! # CAN FD
+//!
+//! Upstream socketcand is classic CAN only (at most 8 data bytes per frame).
+//! FD-aware servers such as
+//! [cda-can-bridge](https://github.com/floroks/cda-can-bridge) run the bus in
+//! CAN FD mode and use the same messages with up to 64 data bytes: received
+//! frames with more than 8 bytes are treated as CAN FD frames, and frames
+//! sent with more than 8 bytes are put on the bus as CAN FD frames (the
+//! server decides FD/BRS for shorter frames from its bus configuration).
+//! Frames longer than 8 bytes are therefore only sent when the ISO-TP socket
+//! is configured for CAN FD via [crate::LinkLayerOptions].
 
-use super::CanFrame;
+use super::{CAN_MAX_DLEN, CANFD_MAX_DLEN, CanFrame};
 use crate::error::Error;
 use std::collections::HashMap;
 use std::io;
@@ -279,7 +291,7 @@ fn encode_send(frame: CanFrame) -> String {
         format!("{arb:X}")
     };
     let mut msg = format!("< send {id} {}", frame.len);
-    for byte in &frame.data[..frame.len as usize] {
+    for byte in frame.payload() {
         msg.push_str(&format!(" {byte:02x}"));
     }
     msg.push_str(" >");
@@ -308,7 +320,7 @@ fn parse_frame(msg: &str) -> Option<CanFrame> {
     // Remaining tokens hold the data as contiguous hex (one block) or, for
     // tolerance, space-separated bytes; concatenate then split into byte pairs.
     let data_hex: String = tokens.collect();
-    let mut data = Vec::with_capacity(8);
+    let mut data = Vec::with_capacity(CANFD_MAX_DLEN);
     let bytes = data_hex.as_bytes();
     let mut i = 0;
     while i + 2 <= bytes.len() {
@@ -316,10 +328,13 @@ fn parse_frame(msg: &str) -> Option<CanFrame> {
         data.push(u8::from_str_radix(pair, 16).ok()?);
         i += 2;
     }
-    if data.len() > 8 {
-        data.truncate(8);
+    // More than 8 bytes can only be a CAN FD frame (relayed by an FD-aware
+    // server such as cda-can-bridge); anything beyond 64 is malformed.
+    if data.len() > CANFD_MAX_DLEN {
+        return None;
     }
-    Some(CanFrame::new(can_id, &data))
+    let fd = data.len() > CAN_MAX_DLEN;
+    Some(CanFrame::with_flags(can_id, &data, fd, false))
 }
 
 #[cfg(test)]
@@ -359,6 +374,31 @@ mod tests {
         let frame = parse_frame("frame 708 1.0").unwrap();
         assert_eq!(frame.can_id, 0x708);
         assert_eq!(frame.len, 0);
+    }
+
+    #[test]
+    fn parse_fd_frame() {
+        let frame =
+            parse_frame("frame 18E02C80 1.0 001462f1903f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f3f0000")
+                .unwrap();
+        assert_eq!(frame.can_id, 0x18E02C80 | EFF_FLAG);
+        assert_eq!(frame.len, 24);
+        assert!(frame.fd);
+        assert_eq!(&frame.payload()[..5], &[0x00, 0x14, 0x62, 0xF1, 0x90]);
+    }
+
+    #[test]
+    fn parse_oversized_frame_is_rejected() {
+        let msg = format!("frame 708 1.0 {}", "00".repeat(65));
+        assert!(parse_frame(&msg).is_none());
+    }
+
+    #[test]
+    fn encode_fd_frame() {
+        let frame = CanFrame::with_flags(0x7E0, &[0xAB; 12], true, true);
+        let msg = encode_send(frame);
+        assert!(msg.starts_with("< send 7E0 12 ab ab"));
+        assert_eq!(msg.matches(" ab").count(), 12);
     }
 
     #[test]

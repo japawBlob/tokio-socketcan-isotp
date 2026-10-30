@@ -1,15 +1,20 @@
 //! Userspace implementation of the ISO 15765-2 transport protocol
-//! (classic CAN 2.0, normal addressing).
+//! (classic CAN 2.0 and CAN FD, normal addressing).
 //!
 //! Implemented: single frames, first/consecutive frames, flow control
 //! (CTS / WAIT / OVERFLOW) with block size and STmin pacing, TX padding,
-//! N_Bs / N_Cr timeouts, payloads up to 4095 bytes, 11-bit and 29-bit ids.
+//! N_Bs / N_Cr timeouts, 11-bit and 29-bit ids, and the ISO 15765-2:2016
+//! extensions used with CAN FD: configurable TX link layer data length
+//! (`tx_dl` 8..=64), escaped single frames (`SF_DL` > 7), escaped first
+//! frames (32-bit `FF_DL`, payloads > 4095 bytes), and padding to valid CAN
+//! FD frame lengths. The RX path accepts all link layer data lengths,
+//! independent of the TX configuration (like the Linux kernel).
 //!
 //! Not implemented (rejected or ignored at socket creation): extended
-//! addressing, listen mode, CAN FD frames, RX padding checks, wait-frame
-//! emission (received wait frames are honored).
+//! addressing, listen mode, RX padding checks, wait-frame emission (received
+//! wait frames are honored).
 
-use crate::channel::{CanFrame, FrameChannel};
+use crate::channel::{CAN_MAX_DLEN, CANFD_MAX_DLEN, CanFrame, FrameChannel, fd_frame_len};
 use crate::types::{ERR_FLAG, RTR_FLAG};
 use std::io;
 use std::time::Duration;
@@ -25,12 +30,18 @@ const FC_CTS: u8 = 0;
 const FC_WAIT: u8 = 1;
 const FC_OVERFLOW: u8 = 2;
 
-/// Max payload of a single frame (classic CAN, normal addressing).
-const SF_MAX: usize = 7;
-/// Max payload bytes per consecutive frame.
-const CF_MAX: usize = 7;
-/// Max ISO-TP payload with the 12-bit FF_DL encoding.
-const MAX_PAYLOAD: usize = 4095;
+/// Max payload of a single frame with the 4-bit `SF_DL` encoding.
+const SF_MAX_4BIT: usize = 7;
+/// Max ISO-TP payload with the 12-bit `FF_DL` encoding; larger payloads use
+/// the 32-bit escape encoding.
+const MAX_12BIT_PAYLOAD: usize = 4095;
+/// Max ISO-TP payload accepted on the RX path (guards memory against bogus
+/// 32-bit first frame lengths); larger transfers are answered with FC
+/// OVERFLOW.
+const MAX_RX_PAYLOAD: usize = 1 << 20;
+/// Padding byte used for mandatory CAN FD padding when TX padding is off
+/// (`CAN_ISOTP_DEFAULT_PAD_CONTENT`).
+const DEFAULT_PAD_CONTENT: u8 = 0xCC;
 
 /// Timeout waiting for a flow control frame after FF / a block (N_Bs).
 const N_BS_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -43,7 +54,8 @@ const MAX_WAIT_FRAMES: u32 = 16;
 pub(crate) struct IsoTpConfig {
     pub tx_id: u32,
     pub rx_id: u32,
-    /// `Some(pad byte)`: pad all transmitted frames to 8 bytes.
+    /// `Some(pad byte)`: pad all transmitted frames to at least 8 bytes (and
+    /// to the next valid CAN FD length).
     pub tx_padding: Option<u8>,
     /// Minimum gap between transmitted consecutive frames (N_As).
     pub frame_txtime: Duration,
@@ -51,6 +63,13 @@ pub(crate) struct IsoTpConfig {
     pub fc_bs: u8,
     /// STmin advertised in flow control frames we emit (raw encoding).
     pub fc_stmin: u8,
+    /// TX link layer data length: max data bytes per transmitted frame (8
+    /// for classic CAN; 8, 12, 16, 20, 24, 32, 48 or 64 for CAN FD).
+    pub tx_dl: usize,
+    /// Transmit CAN FD frames (link layer MTU `CANFD_MTU`).
+    pub fd: bool,
+    /// Set the bit rate switch flag on transmitted CAN FD frames.
+    pub brs: bool,
 }
 
 fn decode_stmin(stmin: u8) -> Duration {
@@ -73,15 +92,31 @@ fn timed_out(msg: &str) -> io::Error {
 }
 
 impl IsoTpConfig {
+    /// Build a frame carrying `payload` (PCI + data, at most `tx_dl` bytes),
+    /// applying TX padding and the mandatory padding to a valid CAN FD frame
+    /// length.
     fn frame(&self, payload: &[u8]) -> CanFrame {
-        let mut frame = CanFrame::new(self.tx_id, payload);
-        if let Some(pad) = self.tx_padding {
-            for byte in &mut frame.data[payload.len()..] {
-                *byte = pad;
-            }
-            frame.len = 8;
+        debug_assert!(payload.len() <= self.tx_dl);
+        let len = payload.len();
+        let (frame_len, pad) = match self.tx_padding {
+            // Like the kernel: pad to at least 8 bytes, and up to the next
+            // valid CAN FD frame length beyond that.
+            Some(pad) => (fd_frame_len(len.max(CAN_MAX_DLEN)), pad),
+            // Mandatory padding for CAN FD frames longer than 8 bytes.
+            None => (fd_frame_len(len), DEFAULT_PAD_CONTENT),
+        };
+        let mut data = [pad; CANFD_MAX_DLEN];
+        data[..len].copy_from_slice(payload);
+        CanFrame::with_flags(self.tx_id, &data[..frame_len], self.fd, self.brs)
+    }
+
+    /// Max payload of an escaped single frame (`0x00`, `SF_DL`, data).
+    fn sf_max(&self) -> usize {
+        if self.tx_dl > CAN_MAX_DLEN {
+            self.tx_dl - 2
+        } else {
+            SF_MAX_4BIT
         }
-        frame
     }
 }
 
@@ -142,27 +177,47 @@ pub(crate) async fn send(
             "empty ISO-TP payload",
         ));
     }
-    if data.len() <= SF_MAX {
-        let mut payload = [0u8; 8];
-        payload[0] = PCI_SF | data.len() as u8;
-        payload[1..=data.len()].copy_from_slice(data);
-        return chan.send(cfg.frame(&payload[..=data.len()])).await;
+    let mut buf = [0u8; CANFD_MAX_DLEN];
+
+    // Single frame: 4-bit SF_DL if it fits a classic frame, otherwise the
+    // CAN FD escape encoding (0x00, SF_DL) when the TX_DL allows it.
+    if data.len() <= SF_MAX_4BIT {
+        buf[0] = PCI_SF | data.len() as u8;
+        buf[1..=data.len()].copy_from_slice(data);
+        return chan.send(cfg.frame(&buf[..=data.len()])).await;
     }
-    if data.len() > MAX_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("ISO-TP payload too large: {} > {MAX_PAYLOAD}", data.len()),
-        ));
+    if data.len() <= cfg.sf_max() {
+        buf[0] = PCI_SF;
+        buf[1] = data.len() as u8;
+        buf[2..2 + data.len()].copy_from_slice(data);
+        return chan.send(cfg.frame(&buf[..2 + data.len()])).await;
     }
 
-    let mut first = [0u8; 8];
-    first[0] = PCI_FF | ((data.len() >> 8) as u8 & 0x0F);
-    first[1] = (data.len() & 0xFF) as u8;
-    first[2..8].copy_from_slice(&data[..6]);
-    chan.send(cfg.frame(&first)).await?;
+    // First frame: 12-bit FF_DL, or the 32-bit escape for > 4095 bytes. It
+    // always fills the whole TX_DL.
+    let header = if data.len() <= MAX_12BIT_PAYLOAD {
+        buf[0] = PCI_FF | ((data.len() >> 8) as u8 & 0x0F);
+        buf[1] = (data.len() & 0xFF) as u8;
+        2
+    } else {
+        let total = u32::try_from(data.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("ISO-TP payload too large: {} bytes", data.len()),
+            )
+        })?;
+        buf[0] = PCI_FF;
+        buf[1] = 0;
+        buf[2..6].copy_from_slice(&total.to_be_bytes());
+        6
+    };
+    let first_take = cfg.tx_dl - header;
+    buf[header..cfg.tx_dl].copy_from_slice(&data[..first_take]);
+    chan.send(cfg.frame(&buf[..cfg.tx_dl])).await?;
 
+    let cf_max = cfg.tx_dl - 1;
     let (mut bs, mut stmin) = wait_for_fc(chan, cfg.rx_id).await?;
-    let mut sent = 6usize;
+    let mut sent = first_take;
     let mut sequence = 1u8;
     let mut in_block = 0u32;
     while sent < data.len() {
@@ -170,11 +225,10 @@ pub(crate) async fn send(
             (bs, stmin) = wait_for_fc(chan, cfg.rx_id).await?;
             in_block = 0;
         }
-        let take = CF_MAX.min(data.len() - sent);
-        let mut payload = [0u8; 8];
-        payload[0] = PCI_CF | sequence;
-        payload[1..=take].copy_from_slice(&data[sent..sent + take]);
-        chan.send(cfg.frame(&payload[..=take])).await?;
+        let take = cf_max.min(data.len() - sent);
+        buf[0] = PCI_CF | sequence;
+        buf[1..=take].copy_from_slice(&data[sent..sent + take]);
+        chan.send(cfg.frame(&buf[..=take])).await?;
         sent += take;
         sequence = (sequence + 1) & 0x0F;
         in_block += 1;
@@ -188,19 +242,38 @@ pub(crate) async fn send(
     Ok(())
 }
 
+/// Decode a single frame; `None` for malformed frames (dropped, like the
+/// kernel).
+fn decode_single_frame(frame: &CanFrame) -> Option<&[u8]> {
+    let frame_len = frame.len as usize;
+    let nibble = (frame.data[0] & 0x0F) as usize;
+    if nibble != 0 {
+        // 4-bit SF_DL: only valid in frames of up to 8 bytes.
+        if frame_len > CAN_MAX_DLEN || nibble >= frame_len {
+            return None;
+        }
+        return Some(&frame.data[1..=nibble]);
+    }
+    // Escape encoding (0x00, SF_DL): only valid in frames longer than 8
+    // bytes.
+    if frame_len <= CAN_MAX_DLEN {
+        return None;
+    }
+    let len = frame.data[1] as usize;
+    if len == 0 || 2 + len > frame_len {
+        return None;
+    }
+    Some(&frame.data[2..2 + len])
+}
+
 pub(crate) async fn recv(chan: &mut FrameChannel, cfg: &IsoTpConfig) -> io::Result<Vec<u8>> {
     loop {
         let frame = recv_matching(chan, cfg.rx_id).await?;
         match frame.data[0] & PCI_MASK {
-            PCI_SF => {
-                let len = (frame.data[0] & 0x0F) as usize;
-                if len == 0 || len > SF_MAX || len >= frame.len as usize {
-                    // len == 0 is the CAN FD escape encoding (unsupported);
-                    // oversized lengths are malformed. Drop, like the kernel.
-                    continue;
-                }
-                return Ok(frame.data[1..=len].to_vec());
-            }
+            PCI_SF => match decode_single_frame(&frame) {
+                Some(payload) => return Ok(payload.to_vec()),
+                None => continue,
+            },
             PCI_FF => return recv_segmented(chan, cfg, &frame).await,
             // Stray CF (aborted transfer) or stale FC: drop.
             _ => continue,
@@ -213,22 +286,37 @@ async fn recv_segmented(
     cfg: &IsoTpConfig,
     first: &CanFrame,
 ) -> io::Result<Vec<u8>> {
-    let total = (((first.data[0] & 0x0F) as usize) << 8) | first.data[1] as usize;
-    if total < 8 {
-        // total == 0 is the CAN FD escape encoding (unsupported), 1..=7
-        // must be sent as single frames.
+    // The sender's link layer data length is the length of its first frame.
+    let rx_dl = first.len as usize;
+    if rx_dl < CAN_MAX_DLEN || fd_frame_len(rx_dl) != rx_dl {
         return Err(invalid_data("invalid ISO-TP first frame length"));
     }
-    if first.len < 8 {
-        return Err(invalid_data("short ISO-TP first frame"));
+    let total12 = (((first.data[0] & 0x0F) as usize) << 8) | first.data[1] as usize;
+    let (total, header) = if total12 != 0 {
+        (total12, 2)
+    } else {
+        let total =
+            u32::from_be_bytes([first.data[2], first.data[3], first.data[4], first.data[5]]);
+        (total as usize, 6)
+    };
+    // A first frame must not carry data that would have fit a single frame
+    // (same check as the kernel).
+    if total < CAN_MAX_DLEN || total + header < rx_dl {
+        return Err(invalid_data("invalid ISO-TP first frame length"));
+    }
+    if total > MAX_RX_PAYLOAD {
+        let overflow = [PCI_FC | FC_OVERFLOW, 0, 0];
+        chan.send(cfg.frame(&overflow)).await?;
+        return Err(invalid_data("ISO-TP payload exceeds the receive buffer"));
     }
 
     let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(&first.data[2..8]);
+    buf.extend_from_slice(&first.data[header..rx_dl]);
 
     let fc = [PCI_FC | FC_CTS, cfg.fc_bs, cfg.fc_stmin];
     chan.send(cfg.frame(&fc)).await?;
 
+    let cf_max = rx_dl - 1;
     let mut sequence = 1u8;
     let mut in_block = 0u32;
     while buf.len() < total {
@@ -241,7 +329,7 @@ async fn recv_segmented(
         if frame.data[0] & 0x0F != sequence {
             return Err(invalid_data("ISO-TP consecutive frame out of sequence"));
         }
-        let take = CF_MAX.min(total - buf.len());
+        let take = cf_max.min(total - buf.len());
         if (frame.len as usize) < 1 + take {
             return Err(invalid_data("short ISO-TP consecutive frame"));
         }
@@ -269,6 +357,18 @@ mod tests {
             frame_txtime: Duration::ZERO,
             fc_bs: 0,
             fc_stmin: 0,
+            tx_dl: 8,
+            fd: false,
+            brs: false,
+        }
+    }
+
+    fn fd_config(tx_id: u32, rx_id: u32, tx_dl: usize) -> IsoTpConfig {
+        IsoTpConfig {
+            tx_dl,
+            fd: true,
+            brs: true,
+            ..config(tx_id, rx_id)
         }
     }
 
@@ -296,7 +396,10 @@ mod tests {
         let frame = peer.recv().await.unwrap();
         assert_eq!(frame.can_id, 0x7E0);
         assert_eq!(frame.len, 8);
-        assert_eq!(frame.data, [0x02, 0x3E, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]);
+        assert_eq!(
+            frame.payload(),
+            [0x02, 0x3E, 0x00, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]
+        );
     }
 
     #[tokio::test]
@@ -447,14 +550,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_payload_errors() {
-        let (mut tx_chan, _peer) = chan_pair();
-        let cfg = config(0x7E0, 0x7E8);
-        let err = send(&mut tx_chan, &cfg, &[0u8; 4096]).await.unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[tokio::test]
     async fn foreign_ids_are_ignored() {
         let (mut rx_chan, mut peer) = chan_pair();
         let cfg = config(0x7E8, 0x7E0);
@@ -470,5 +565,186 @@ mod tests {
         let data = recv(&mut rx_chan, &cfg).await.unwrap();
         assert_eq!(data, vec![0x10, 0x03]);
         relay.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn classic_payload_above_4095_uses_escaped_first_frame() {
+        let (mut a, mut b) = chan_pair();
+        let cfg_a = config(0x7E0, 0x7E8);
+        let cfg_b = config(0x7E8, 0x7E0);
+        let payload: Vec<u8> = (0..5000).map(|i| (i % 253) as u8).collect();
+        let expected = payload.clone();
+        let receiver = tokio::spawn(async move { recv(&mut b, &cfg_b).await.unwrap() });
+        send(&mut a, &cfg_a, &payload).await.unwrap();
+        assert_eq!(receiver.await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn fd_short_single_frame_uses_4bit_length() {
+        let (mut tx_chan, mut peer) = chan_pair();
+        let mut cfg = fd_config(0x7E0, 0x7E8, 64);
+        cfg.tx_padding = Some(0x55);
+        send(&mut tx_chan, &cfg, &[0x22, 0xF1, 0x90]).await.unwrap();
+        let frame = peer.recv().await.unwrap();
+        assert!(frame.fd);
+        assert!(frame.brs);
+        assert_eq!(
+            frame.payload(),
+            [0x03, 0x22, 0xF1, 0x90, 0x55, 0x55, 0x55, 0x55]
+        );
+    }
+
+    #[tokio::test]
+    async fn fd_escaped_single_frame_is_padded_to_valid_length() {
+        let (mut tx_chan, mut peer) = chan_pair();
+        let cfg = fd_config(0x7E0, 0x7E8, 64);
+        let payload: Vec<u8> = (0..20).collect();
+        send(&mut tx_chan, &cfg, &payload).await.unwrap();
+        let frame = peer.recv().await.unwrap();
+        // 2 PCI bytes + 20 data bytes -> next valid CAN FD length 24, with
+        // mandatory 0xCC padding.
+        assert_eq!(frame.len, 24);
+        assert!(frame.fd);
+        assert_eq!(&frame.payload()[..2], &[0x00, 20]);
+        assert_eq!(&frame.payload()[2..22], payload.as_slice());
+        assert_eq!(&frame.payload()[22..], &[0xCC, 0xCC]);
+    }
+
+    #[tokio::test]
+    async fn fd_single_frame_limited_by_tx_dl() {
+        // With tx_dl = 16 the escaped SF carries at most 14 bytes; 15 bytes
+        // need a first frame.
+        let (mut tx_chan, mut peer) = chan_pair();
+        let cfg = fd_config(0x7E0, 0x7E8, 16);
+        let sender =
+            tokio::spawn(async move { send(&mut tx_chan, &cfg, &[0xAB; 15]).await.unwrap_err() });
+        let ff = peer.recv().await.unwrap();
+        assert_eq!(ff.len, 16);
+        assert_eq!(&ff.payload()[..2], &[PCI_FF, 15]);
+        // No flow control -> N_Bs timeout.
+        assert_eq!(sender.await.unwrap().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn receives_escaped_single_frame_from_ecu() {
+        // Real response captured on a CAN FD bench (PES297M, 22 F1 90).
+        let (mut rx_chan, mut peer) = chan_pair();
+        let cfg = config(0x7E8, 0x7E0);
+        let mut data = vec![0x00, 0x14, 0x62, 0xF1, 0x90];
+        data.extend_from_slice(&[0x3F; 17]);
+        data.extend_from_slice(&[0x00, 0x00]);
+        peer.send(CanFrame::with_flags(0x7E0, &data, true, true))
+            .await
+            .unwrap();
+        let payload = recv(&mut rx_chan, &cfg).await.unwrap();
+        assert_eq!(payload.len(), 20);
+        assert_eq!(&payload[..3], &[0x62, 0xF1, 0x90]);
+    }
+
+    #[tokio::test]
+    async fn malformed_single_frames_are_dropped() {
+        let (mut rx_chan, mut peer) = chan_pair();
+        let cfg = config(0x7E8, 0x7E0);
+        let relay = tokio::spawn(async move {
+            // Escape encoding in a classic frame: invalid.
+            peer.send(CanFrame::new(0x7E0, &[0x00, 0x03, 1, 2, 3, 0, 0, 0]))
+                .await
+                .unwrap();
+            // 4-bit SF_DL in a frame longer than 8 bytes: invalid.
+            peer.send(CanFrame::with_flags(
+                0x7E0,
+                &[0x02, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                true,
+                false,
+            ))
+            .await
+            .unwrap();
+            // Escaped SF_DL exceeding the frame: invalid.
+            let mut long = [0u8; 12];
+            long[1] = 11;
+            peer.send(CanFrame::with_flags(0x7E0, &long, true, false))
+                .await
+                .unwrap();
+            peer.send(CanFrame::new(0x7E0, &[0x01, 0x42]))
+                .await
+                .unwrap();
+        });
+        assert_eq!(recv(&mut rx_chan, &cfg).await.unwrap(), vec![0x42]);
+        relay.await.unwrap();
+    }
+
+    async fn fd_round_trip(len: usize, tx_dl_a: usize, tx_dl_b: usize, padding: Option<u8>) {
+        let (mut a, mut b) = chan_pair();
+        let cfg_a = IsoTpConfig {
+            tx_padding: padding,
+            ..fd_config(0x7E0, 0x7E8, tx_dl_a)
+        };
+        let cfg_b = IsoTpConfig {
+            fc_bs: 3,
+            tx_padding: padding,
+            ..fd_config(0x7E8, 0x7E0, tx_dl_b)
+        };
+        let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let receiver = tokio::spawn(async move { recv(&mut b, &cfg_b).await.unwrap() });
+        send(&mut a, &cfg_a, &payload).await.unwrap();
+        assert_eq!(
+            receiver.await.unwrap(),
+            expected,
+            "len {len} tx_dl {tx_dl_a}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fd_round_trips() {
+        for tx_dl in [8, 12, 16, 20, 24, 32, 48, 64] {
+            for len in [
+                1, 7, 8, 10, 11, 61, 62, 63, 64, 100, 500, 4095, 4096, 10_000,
+            ] {
+                fd_round_trip(len, tx_dl, 64, None).await;
+                fd_round_trip(len, tx_dl, 8, Some(0x55)).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fd_frames_have_valid_lengths_and_cf_size() {
+        let (mut a, mut b) = chan_pair();
+        let cfg_a = fd_config(0x7E0, 0x7E8, 64);
+        let payload = vec![0x11u8; 200];
+        let sender = tokio::spawn(async move {
+            send(&mut a, &cfg_a, &payload).await.unwrap();
+        });
+        let ff = b.recv().await.unwrap();
+        assert_eq!(ff.len, 64);
+        assert_eq!(&ff.payload()[..2], &[PCI_FF, 200]);
+        b.send(CanFrame::new(0x7E8, &[PCI_FC | FC_CTS, 0, 0]))
+            .await
+            .unwrap();
+        // 200 - 62 = 138 bytes in CFs of 63: 63 + 63 + 12.
+        let lens: Vec<u8> = [b.recv().await, b.recv().await, b.recv().await]
+            .into_iter()
+            .map(|f| f.unwrap().len)
+            .collect();
+        // The last CF carries 13 bytes (PCI + 12) -> padded to 16.
+        assert_eq!(lens, vec![64, 64, 16]);
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_first_frame_is_rejected_with_overflow() {
+        let (mut rx_chan, mut peer) = chan_pair();
+        let cfg = config(0x7E8, 0x7E0);
+        let relay = tokio::spawn(async move {
+            let mut ff = [0u8; 8];
+            ff[0] = PCI_FF;
+            ff[2..6].copy_from_slice(&u32::MAX.to_be_bytes());
+            peer.send(CanFrame::new(0x7E0, &ff)).await.unwrap();
+            peer.recv().await.unwrap()
+        });
+        let err = recv(&mut rx_chan, &cfg).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let fc = relay.await.unwrap();
+        assert_eq!(fc.data[0], PCI_FC | FC_OVERFLOW);
     }
 }

@@ -1,4 +1,4 @@
-//! Raw SocketCAN (`CAN_RAW`) frame channel.
+//! Raw SocketCAN (`CAN_RAW`) frame channel, classic CAN and CAN FD.
 //!
 //! Each channel owns its own raw socket with a kernel-side filter on the
 //! socket's rx id. The kernel duplicates every bus frame to every matching
@@ -32,7 +32,18 @@ impl Drop for RawCanFd {
 
 pub(crate) struct RawCanChannel {
     fd: AsyncFd<RawCanFd>,
+    /// `CAN_RAW_FD_FRAMES` was enabled successfully.
+    fd_enabled: bool,
 }
+
+/// `sizeof(struct can_frame)`.
+const CAN_MTU: usize = size_of::<libc::can_frame>();
+/// `sizeof(struct canfd_frame)`.
+const CANFD_MTU: usize = size_of::<libc::canfd_frame>();
+/// `canfd_frame.flags`: bit rate switch.
+const CANFD_BRS: u8 = 0x01;
+/// `canfd_frame.flags`: mark CAN FD for dual use of `struct canfd_frame`.
+const CANFD_FDF: u8 = 0x04;
 
 impl RawCanChannel {
     /// Open a `CAN_RAW` socket on `ifname`, filtered to data frames whose
@@ -88,27 +99,49 @@ impl RawCanChannel {
             return Err(Error::from(io::Error::last_os_error()));
         }
 
+        // Accept and allow sending CAN FD frames. Fails on kernels/interfaces
+        // without CAN FD support; classic operation still works then, and an
+        // attempt to send an FD frame surfaces the kernel's error.
+        let enable: libc::c_int = 1;
+        let fd_enabled = unsafe {
+            libc::setsockopt(
+                fd.0,
+                libc::SOL_CAN_RAW,
+                libc::CAN_RAW_FD_FRAMES,
+                std::ptr::addr_of!(enable).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } == 0;
+
         Ok(RawCanChannel {
             fd: AsyncFd::new(fd)?,
+            fd_enabled,
         })
     }
 
     pub(crate) async fn send(&self, frame: CanFrame) -> io::Result<()> {
-        let mut raw: libc::can_frame = unsafe { std::mem::zeroed() };
+        if frame.fd && !self.fd_enabled {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "CAN FD frames are not supported on this CAN_RAW socket/interface",
+            ));
+        }
+        let mut raw: libc::canfd_frame = unsafe { std::mem::zeroed() };
         raw.can_id = frame.can_id;
-        raw.can_dlc = frame.len;
-        raw.data[..frame.data.len()].copy_from_slice(&frame.data);
+        raw.len = frame.len;
+        raw.data[..frame.len as usize].copy_from_slice(frame.payload());
+        let size = if frame.fd {
+            raw.flags = CANFD_FDF | if frame.brs { CANFD_BRS } else { 0 };
+            CANFD_MTU
+        } else {
+            CAN_MTU
+        };
         loop {
             let mut guard = self.fd.writable().await?;
             match guard.try_io(|inner| {
-                let n = unsafe {
-                    libc::write(
-                        inner.get_ref().0,
-                        std::ptr::addr_of!(raw).cast(),
-                        size_of::<libc::can_frame>(),
-                    )
-                };
-                if n == size_of::<libc::can_frame>() as isize {
+                let n =
+                    unsafe { libc::write(inner.get_ref().0, std::ptr::addr_of!(raw).cast(), size) };
+                if n == size as isize {
                     Ok(())
                 } else {
                     Err(io::Error::last_os_error())
@@ -123,17 +156,19 @@ impl RawCanChannel {
     pub(crate) async fn recv(&self) -> io::Result<CanFrame> {
         loop {
             let mut guard = self.fd.readable().await?;
-            let mut raw: libc::can_frame = unsafe { std::mem::zeroed() };
+            let mut raw: libc::canfd_frame = unsafe { std::mem::zeroed() };
             match guard.try_io(|inner| {
                 let n = unsafe {
                     libc::read(
                         inner.get_ref().0,
                         std::ptr::addr_of_mut!(raw).cast(),
-                        size_of::<libc::can_frame>(),
+                        CANFD_MTU,
                     )
                 };
-                if n == size_of::<libc::can_frame>() as isize {
-                    Ok(())
+                if n == CANFD_MTU as isize {
+                    Ok(true)
+                } else if n == CAN_MTU as isize {
+                    Ok(false)
                 } else if n < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -143,15 +178,16 @@ impl RawCanChannel {
                     ))
                 }
             }) {
-                Ok(Ok(())) => {
-                    let len = raw.can_dlc.min(8);
-                    let mut data = [0u8; 8];
-                    data.copy_from_slice(&raw.data[..8]);
-                    return Ok(CanFrame {
-                        can_id: raw.can_id,
-                        len,
-                        data,
-                    });
+                Ok(Ok(is_fd)) => {
+                    // For a classic can_frame, `len` aliases `can_dlc`.
+                    let max = if is_fd { 64 } else { 8 };
+                    let len = (raw.len as usize).min(max);
+                    return Ok(CanFrame::with_flags(
+                        raw.can_id,
+                        &raw.data[..len],
+                        is_fd,
+                        is_fd && raw.flags & CANFD_BRS != 0,
+                    ));
                 }
                 Ok(Err(err)) => return Err(err),
                 Err(_would_block) => continue,

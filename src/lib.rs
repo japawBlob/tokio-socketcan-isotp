@@ -16,10 +16,16 @@
 //! The kernel backend is the original transport of this crate and implements
 //! the full ISO-TP protocol in the kernel. The userspace backends implement a
 //! subset of ISO 15765-2 (single/first/consecutive frames and flow control
-//! for classic CAN with normal addressing) and exist so that tests and
-//! simulators can run without the `can_isotp` kernel module (`rawcan:`) or
-//! without any local CAN support at all (`socketcand:`, which reaches a bus
-//! over TCP and is also available on non-Linux platforms).
+//! with normal addressing, for classic CAN and CAN FD) and exist so that
+//! tests and simulators can run without the `can_isotp` kernel module
+//! (`rawcan:`) or without any local CAN support at all (`socketcand:`, which
+//! reaches a bus over TCP and is also available on non-Linux platforms).
+//!
+//! CAN FD is selected the same way for all backends, via
+//! [LinkLayerOptions] (e.g. `LinkLayerOptions::can_fd(64, TxFlags::CANFD_BRS)`):
+//! the kernel backend hands them to the kernel, the userspace backends
+//! implement the ISO 15765-2:2016 CAN FD framing themselves. The receive
+//! path of the userspace backends accepts CAN FD frames regardless.
 //!
 //! You may experience busy waiting, or soft locks when two consecutive locks.
 //! This is due to the error in Linux Kernel, which is now
@@ -73,8 +79,8 @@ mod userspace;
 pub use crate::error::Error;
 pub use crate::types::{
     AF_CAN, CAN_ISOTP, CAN_ISOTP_LL_OPTS, CAN_ISOTP_OPTS, CAN_ISOTP_RECV_FC, CAN_ISOTP_RX_STMIN,
-    CAN_ISOTP_TX_STMIN, CAN_MAX_DLEN, EFF_FLAG, EFF_MASK, ERR_FLAG, ERR_MASK, ERR_MASK_ALL,
-    ERR_MASK_NONE, ExtendedId, FlowControlOptions, Id, IsoTpBehaviour, IsoTpOptions,
+    CAN_ISOTP_TX_STMIN, CAN_MAX_DLEN, CANFD_MTU, EFF_FLAG, EFF_MASK, ERR_FLAG, ERR_MASK,
+    ERR_MASK_ALL, ERR_MASK_NONE, ExtendedId, FlowControlOptions, Id, IsoTpBehaviour, IsoTpOptions,
     LinkLayerOptions, PF_CAN, RECV_BUFFER_SIZE, RTR_FLAG, SFF_MASK, SOL_CAN_BASE, SOL_CAN_ISOTP,
     StandardId, TxFlags,
 };
@@ -169,6 +175,7 @@ impl IsoTpSocket {
                             dst,
                             isotp_options,
                             rx_flow_control_options,
+                            link_layer_options,
                         )?,
                     )))
                 }
@@ -192,6 +199,7 @@ impl IsoTpSocket {
                             dst,
                             isotp_options,
                             rx_flow_control_options,
+                            link_layer_options,
                         )?,
                     )))
                 }
