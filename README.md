@@ -64,6 +64,8 @@ The backend is selected at runtime by the address string passed to
   `< frame ... >` / `< send ... >` messages - see
   `src/channel/socketcand.rs`. Useful when the CAN bus lives on another host
   or in a container the client cannot attach to directly. Upstream
-  socketcand is classic CAN only; CAN FD needs an FD-aware server such as
-  [cda-can-bridge](https://github.com/floroks/cda-can-bridge), which relays
-  frames of up to 64 bytes with the same messages.
+  socketcand is classic CAN only; CAN FD needs an FD-capable server such as
+  [cda-can-bridge](https://github.com/floroks/cda-can-bridge), which exchanges
+  FD frames as `< fdframe <id> <flags> <ts> <data> >` / `< fdsend <id> <flags>
+  <len> <bytes> >` (syntax of
+  [linux-can/socketcand#79](https://github.com/linux-can/socketcand/pull/79)).

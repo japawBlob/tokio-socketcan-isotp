@@ -37,16 +37,23 @@
 //! # CAN FD
 //!
 //! Upstream socketcand is classic CAN only (at most 8 data bytes per frame).
-//! FD-aware servers such as
-//! [cda-can-bridge](https://github.com/floroks/cda-can-bridge) run the bus in
-//! CAN FD mode and use the same messages with up to 64 data bytes: received
-//! frames with more than 8 bytes are treated as CAN FD frames, and frames
-//! sent with more than 8 bytes are put on the bus as CAN FD frames (the
-//! server decides FD/BRS for shorter frames from its bus configuration).
-//! Frames longer than 8 bytes are therefore only sent when the ISO-TP socket
-//! is configured for CAN FD via [crate::LinkLayerOptions].
-
-use super::{CAN_MAX_DLEN, CANFD_MAX_DLEN, CanFrame};
+//! FD-capable servers such as
+//! [cda-can-bridge](https://github.com/floroks/cda-can-bridge) exchange CAN FD
+//! frames with two additional raw-mode messages (syntax of the upstream
+//! proposal [linux-can/socketcand#79](https://github.com/linux-can/socketcand/pull/79)):
+//!
+//! ```text
+//! daemon -> < fdframe <can_id> <flags> <sec.usec> <datahex> >
+//! client -> < fdsend <can_id> <flags> <len> <b0> <b1> ... >
+//! ```
+//!
+//! `flags` are the `canfd_frame.flags` in hex (`0x01` = BRS, `0x02` = ESI).
+//! Frames are sent with `< fdsend >` only when the ISO-TP socket is configured
+//! for CAN FD via [crate::LinkLayerOptions]; classic frames always use
+//! `< send >`. For servers that relay FD frames as plain `< frame >` with more
+//! than 8 bytes ([linux-can/socketcand#72](https://github.com/linux-can/socketcand/pull/72)
+//! style), such frames are accepted as CAN FD frames as well.
+use super::{CAN_MAX_DLEN, CANFD_MAX_DLEN, CanFrame, is_valid_fd_len};
 use crate::error::Error;
 use std::collections::HashMap;
 use std::io;
@@ -63,6 +70,8 @@ const EFF_FLAG: u32 = 0x8000_0000;
 const EFF_MASK: u32 = 0x1fff_ffff;
 /// Largest 11-bit standard id.
 const SFF_MAX: u32 = 0x7ff;
+/// `canfd_frame.flags`: bit rate switch.
+const CANFD_BRS: u8 = 0x01;
 /// Longest backoff between reconnect attempts.
 const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
@@ -281,31 +290,43 @@ fn take_message(buf: &mut Vec<u8>) -> Option<String> {
     Some(inner)
 }
 
-/// Render a `< send ... >` message for `frame`.
+/// Render a `< send ... >` (classic) or `< fdsend ... >` (CAN FD) message for
+/// `frame`.
 fn encode_send(frame: CanFrame) -> String {
     let extended = frame.can_id & EFF_FLAG != 0;
     let arb = frame.can_id & EFF_MASK;
     let id = if extended {
         format!("{arb:08X}")
     } else {
-        format!("{arb:X}")
+        format!("{arb:03X}")
     };
-    let mut msg = format!("< send {id} {}", frame.len);
+    let mut msg = if frame.fd {
+        let flags = if frame.brs { CANFD_BRS } else { 0 };
+        format!("< fdsend {id} {flags:02X} {}", frame.len)
+    } else {
+        format!("< send {id} {}", frame.len)
+    };
     for byte in frame.payload() {
         msg.push_str(&format!(" {byte:02x}"));
     }
     msg.push_str(" >");
     msg
 }
-
 /// Parse the inner content of a message into a [CanFrame], or `None` if it is
-/// not a `frame` message we can decode.
+/// not a `frame` / `fdframe` message we can decode.
 fn parse_frame(msg: &str) -> Option<CanFrame> {
     let mut tokens = msg.split_whitespace();
-    if tokens.next()? != "frame" {
-        return None;
-    }
+    let fd_message = match tokens.next()? {
+        "frame" => false,
+        "fdframe" => true,
+        _ => return None,
+    };
     let id_tok = tokens.next()?;
+    let flags = if fd_message {
+        u8::from_str_radix(tokens.next()?, 16).ok()?
+    } else {
+        0
+    };
     let _timestamp = tokens.next()?; // <sec.usec>, ignored
     let id_val = u32::from_str_radix(id_tok, 16).ok()?;
     // socketcand prints extended ids as eight hex digits; treat anything
@@ -328,15 +349,20 @@ fn parse_frame(msg: &str) -> Option<CanFrame> {
         data.push(u8::from_str_radix(pair, 16).ok()?);
         i += 2;
     }
-    // More than 8 bytes can only be a CAN FD frame (relayed by an FD-aware
-    // server such as cda-can-bridge); anything beyond 64 is malformed.
-    if data.len() > CANFD_MAX_DLEN {
+    // A plain `< frame >` with more than 8 bytes can only be a CAN FD frame
+    // (socketcand#72-style servers); anything beyond 64 bytes or not a valid
+    // CAN FD length is malformed.
+    if data.len() > CANFD_MAX_DLEN || (data.len() > CAN_MAX_DLEN && !is_valid_fd_len(data.len())) {
         return None;
     }
-    let fd = data.len() > CAN_MAX_DLEN;
-    Some(CanFrame::with_flags(can_id, &data, fd, false))
+    let fd = fd_message || data.len() > CAN_MAX_DLEN;
+    Some(CanFrame::with_flags(
+        can_id,
+        &data,
+        fd,
+        flags & CANFD_BRS != 0,
+    ))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,8 +423,40 @@ mod tests {
     fn encode_fd_frame() {
         let frame = CanFrame::with_flags(0x7E0, &[0xAB; 12], true, true);
         let msg = encode_send(frame);
-        assert!(msg.starts_with("< send 7E0 12 ab ab"));
+        assert!(msg.starts_with("< fdsend 7E0 01 12 ab ab"));
         assert_eq!(msg.matches(" ab").count(), 12);
+        // Short CAN FD frame without BRS is still an fdsend.
+        let frame = CanFrame::with_flags(0x18DA10F1 | EFF_FLAG, &[0x3E, 0x00], true, false);
+        assert_eq!(encode_send(frame), "< fdsend 18DA10F1 00 2 3e 00 >");
+    }
+
+    #[test]
+    fn encode_pads_standard_id() {
+        let frame = CanFrame::new(0x12, &[0x01]);
+        assert_eq!(encode_send(frame), "< send 012 1 01 >");
+    }
+
+    #[test]
+    fn parse_fdframe() {
+        let frame = parse_frame("fdframe 7E8 01 1.000002 027E00").unwrap();
+        assert_eq!(frame.can_id, 0x7E8);
+        assert!(frame.fd);
+        assert!(frame.brs);
+        assert_eq!(frame.payload(), &[0x02, 0x7E, 0x00]);
+
+        let frame =
+            parse_frame("fdframe 18E02C80 00 1.0 001462F1903F3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F3F0000")
+                .unwrap();
+        assert_eq!(frame.can_id, 0x18E02C80 | EFF_FLAG);
+        assert!(frame.fd);
+        assert!(!frame.brs);
+        assert_eq!(frame.len, 24);
+    }
+
+    #[test]
+    fn parse_invalid_fd_length_is_rejected() {
+        assert!(parse_frame(&format!("fdframe 7E8 01 1.0 {}", "00".repeat(10))).is_none());
+        assert!(parse_frame("fdframe 7E8 zz 1.0 00").is_none());
     }
 
     #[test]
