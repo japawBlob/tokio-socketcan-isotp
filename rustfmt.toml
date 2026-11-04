@@ -1,0 +1,5 @@
+# Match the eclipse-opensovd shared rustfmt config (the consuming repo's
+# pre-commit cargo-fmt hook also formats this path dependency): same import
+# ordering rules, so `cargo fmt --check` agrees in both repos.
+style_edition = "2024"
+max_width = 100
